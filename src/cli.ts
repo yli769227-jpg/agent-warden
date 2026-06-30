@@ -68,6 +68,7 @@ function printUsage(): void {
       `  ${pc.cyan('version')}           Print version and exit`,
       `  ${pc.cyan('export [config]')}   Export audit log to CSV (--output, --since, --tool, --verdict)`,
       `  ${pc.cyan('bench')}             Measure per-call policy+scrubber overhead (--iterations N, --json)`,
+      `  ${pc.cyan('rotate')}            Manually rotate the audit log (--no-compress, --list)`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -853,6 +854,74 @@ async function cmdBench(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: rotate ──────────────────────────────────────────────────────────
+
+async function cmdRotate(flags: string[]): Promise<void> {
+  // Flags: --compress/--no-compress, --max-files N, --list
+  let compress    = true;
+  let maxFiles    = 5;
+  let listOnly    = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === '--no-compress')   { compress = false; }
+    else if (f === '--compress') { compress = true; }
+    else if (f === '--list' || f === '-l') { listOnly = true; }
+    else if (f === '--max-files' && flags[i + 1]) {
+      const n = parseInt(flags[++i]!, 10);
+      if (!isNaN(n) && n > 0) maxFiles = n;
+    }
+  }
+
+  const { createLogRotator: makeRotator } = await import('./rotate.js');
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+  const rotator = makeRotator(logFile, { enabled: true, compress, maxFiles });
+
+  if (!rotator) {
+    console.error(pc.red('Rotation is disabled in config.'));
+    process.exit(1);
+  }
+
+  const backups = rotator.listBackups();
+
+  if (listOnly) {
+    if (backups.length === 0) {
+      console.log(pc.dim('No rotated backups found.'));
+      return;
+    }
+    console.log(pc.bold('Rotated backups:'));
+    for (const b of backups) {
+      const kb = (b.sizeBytes / 1024).toFixed(1);
+      console.log(`  ${pc.cyan(b.path.split('/').pop()!)}  ${kb} KB  ${b.mtime.toISOString()}`);
+    }
+    return;
+  }
+
+  if (!fs.existsSync(logFile)) {
+    console.log(pc.yellow(`Log file not found: ${logFile}`));
+    return;
+  }
+
+  const size = fs.statSync(logFile).size;
+  if (size === 0) {
+    console.log(pc.yellow('Log file is empty — nothing to rotate.'));
+    return;
+  }
+
+  process.stderr.write = () => true;   // suppress rotate log lines from output
+  const finalPath = await rotator.rotate();
+  const origWrite = process.stderr.write;
+  process.stderr.write = origWrite;
+
+  const kb = (size / 1024).toFixed(1);
+  console.log(`${pc.green('✅')} Rotated ${kb} KB → ${pc.cyan(finalPath)}`);
+
+  if (backups.length > 0) {
+    console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
 
@@ -907,6 +976,10 @@ async function main(): Promise<void> {
 
     case 'bench':
       await cmdBench(argv.slice(1));
+      break;
+
+    case 'rotate':
+      await cmdRotate(argv.slice(1));
       break;
 
     default:
