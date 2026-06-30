@@ -15,6 +15,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import url from 'node:url';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import pc from 'picocolors';
@@ -22,6 +23,24 @@ import { loadConfig } from './config.js';
 import { runProxy } from './proxy.js';
 import { KillSwitch } from './killswitch.js';
 import type { AuditEntry } from './types.js';
+
+// ─── Version (read once from package.json at module load) ─────────────────────
+
+function readVersion(): string {
+  try {
+    const pkgPath = path.resolve(
+      path.dirname(url.fileURLToPath(import.meta.url)),
+      '..',
+      'package.json',
+    );
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { version: string };
+    return pkg.version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
+const VERSION = readVersion();
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -33,7 +52,7 @@ function printUsage(): void {
   console.log(
     [
       '',
-      `${pc.bold('agent-warden')} — local MCP audit proxy`,
+      `${pc.bold('agent-warden')} ${pc.dim(`v${VERSION}`)} — local MCP audit proxy`,
       '',
       `${pc.bold('Usage:')}`,
       `  warden <command> [options]`,
@@ -46,6 +65,7 @@ function printUsage(): void {
       `  ${pc.cyan('stats')}             Show audit statistics (--since, --json for machine output)`,
       `  ${pc.cyan('check [config]')}    Verify config and downstream server reachability`,
       `  ${pc.cyan('init')}              Write a starter warden.config.yaml in the current directory`,
+      `  ${pc.cyan('version')}           Print version and exit`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -616,6 +636,11 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  if (argv[0] === '--version' || argv[0] === '-V') {
+    console.log(VERSION);
+    process.exit(0);
+  }
+
   const command = argv[0];
 
   switch (command) {
@@ -645,6 +670,10 @@ async function main(): Promise<void> {
 
     case 'init':
       cmdInit();
+      break;
+
+    case 'version':
+      console.log(VERSION);
       break;
 
     default:
