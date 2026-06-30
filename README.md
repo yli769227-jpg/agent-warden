@@ -143,10 +143,13 @@ scrubber:
 | `warden run [config]` | Start the proxy in stdio mode |
 | `warden kill [reason]` | Arm the kill switch — all tool calls denied immediately |
 | `warden unkill` | Disarm the kill switch and resume normal proxying |
-| `warden log` | Stream the audit log to stdout in follow mode (Ctrl+C to stop) |
-| `warden stats` | Print tool call counts and deny rates from the current log |
-| `warden check [config]` | Verify config and probe downstream server reachability |
+| `warden log` | Stream the audit log (`--tool`, `--verdict`, `--since`, `--tail N`, `--no-follow`, `--json`) |
+| `warden stats` | Print tool call counts, deny rates, avg latency (`--since`, `--json`) |
+| `warden export` | Export audit log to CSV (`--output`, `--since`, `--tool`, `--verdict`) |
+| `warden check [config]` | Verify config and probe **all** downstream servers in parallel |
+| `warden bench` | Measure per-call policy+scrubber overhead (`--iterations N`, `--json`) |
 | `warden init` | Generate `warden.config.yaml` in the current directory |
+| `warden version` | Print version |
 
 ---
 
@@ -414,6 +417,12 @@ rules:
 - [x] Kill switch (file-based, instant)
 - [x] Rate limiting (token-bucket per tool)
 - [x] Webhook alerts (deny / kill / rate-limit events)
+- [x] `warden log` with `--tool`, `--verdict`, `--since`, `--tail N`, `--json` filters
+- [x] `warden stats` with `--since`, `--json`, avg latency per tool
+- [x] `warden export` — CSV export for spreadsheet analysis
+- [x] `warden bench` — in-process latency benchmark
+- [x] `warden check` — probes all configured servers in parallel
+- [x] `${VAR}` expansion in server env and webhook targets
 - [ ] Web dashboard — local browser UI to view audit log and visualize call patterns
 - [ ] Log rotation — size or time-based JSONL rotation with compression
 - [ ] OPA integration — use Open Policy Agent `.rego` files as the policy engine
@@ -428,7 +437,7 @@ git clone https://github.com/yli769227-jpg/agent-warden.git
 cd agent-warden
 npm install --include=optional
 npm run build
-npm test              # 70 tests (60 unit + 10 integration)
+npm test              # 111 tests (98 unit + 13 integration)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow and PR checklist.
