@@ -1229,6 +1229,211 @@ render();
   }
 }
 
+// ─── Command: scope ───────────────────────────────────────────────────────────
+
+async function cmdScope(flags: string[]): Promise<void> {
+  // Analyses tool call arguments to build a map of what file paths, URLs,
+  // GitHub repos, and other resources were accessed by each tool.
+  //
+  // "What files did the agent touch in the last hour?"
+  //
+  // Heuristics for resource extraction (applied to args JSON):
+  //   - Keys containing "path", "file", "dir", "url", "repo", "target",
+  //     "resource", "src", "dest", "source", "destination" are extracted.
+  //   - Values that look like absolute paths (/foo/bar) or relative (./foo)
+  //     are classified as filesystem resources.
+  //   - Values matching https?:// are URLs.
+  //   - owner/repo patterns are GitHub repos.
+  //
+  // Flags:
+  //   --since/-s <expr>   Only include entries since this date (default: 1h)
+  //   --window/-w <h>     Window in hours (overrides --since)
+  //   --tool/-t <glob>    Filter to matching tools
+  //   --json/-j           Machine-readable output
+  //   --top <N>           Top resources per category (default 20)
+
+  let sinceDate: Date | undefined;
+  let toolFilter: string | undefined;
+  let jsonOutput  = false;
+  let topN        = 20;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if ((f === '--window' || f === '-w') && flags[i + 1]) {
+      const h    = parseFloat(flags[++i]!);
+      sinceDate  = new Date(Date.now() - h * 3_600_000);
+    } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
+      toolFilter = flags[++i];
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if (f === '--top' && flags[i + 1]) {
+      topN       = parseInt(flags[++i]!, 10) || 20;
+    }
+  }
+
+  // Default window: 1 hour
+  if (!sinceDate) sinceDate = new Date(Date.now() - 3_600_000);
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Resource extraction helpers ─────────────────────────────────────────────
+  const RESOURCE_KEYS = new Set([
+    'path', 'file', 'dir', 'url', 'repo', 'target', 'resource',
+    'src', 'dest', 'source', 'destination', 'filename', 'filepath',
+    'directory', 'location', 'bucket', 'key',
+  ]);
+
+  type Category = 'filesystem' | 'url' | 'github' | 'other';
+
+  function classify(value: string): Category {
+    if (/^https?:\/\//i.test(value))         return 'url';
+    if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(value) && !value.includes('//', 1)) return 'github';
+    if (/^(\/|\.\/|\.\.\/)/.test(value) || /^[A-Z]:\\/i.test(value)) return 'filesystem';
+    return 'other';
+  }
+
+  function extractResources(args: unknown, tool: string): Array<{ resource: string; category: Category; tool: string }> {
+    const out: Array<{ resource: string; category: Category; tool: string }> = [];
+    if (!args || typeof args !== 'object') return out;
+
+    function walk(obj: unknown): void {
+      if (typeof obj === 'string') {
+        const v = obj.trim();
+        if (v.length < 2 || v.length > 512) return;
+        if (/^https?:\/\//i.test(v)) {
+          out.push({ resource: v, category: 'url', tool });
+        } else if (/^(\/|\.\/|\.\.\/)/.test(v)) {
+          out.push({ resource: v, category: 'filesystem', tool });
+        }
+        return;
+      }
+      if (Array.isArray(obj)) { obj.forEach(walk); return; }
+      if (typeof obj === 'object' && obj !== null) {
+        for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+          if (RESOURCE_KEYS.has(k.toLowerCase())) {
+            if (typeof v === 'string' && v.trim().length > 0) {
+              const val = v.trim();
+              out.push({ resource: val, category: classify(val), tool });
+            } else {
+              walk(v);
+            }
+          } else {
+            walk(v);
+          }
+        }
+      }
+    }
+
+    walk(args);
+    return out;
+  }
+
+  // ── Read log ────────────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  type ResourceCount = { resource: string; category: Category; tools: Set<string>; calls: number };
+  const byResource = new Map<string, ResourceCount>();
+  let   total      = 0;
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    const tool = entry.tool ?? '(unknown)';
+    if (toolFilter) {
+      const pattern = toolFilter.replace(/\*/g, '.*').replace(/\?/g, '.');
+      if (!new RegExp(`^${pattern}$`, 'i').test(tool)) continue;
+    }
+
+    total++;
+    const extracted = extractResources(entry.args, tool);
+    for (const { resource, category } of extracted) {
+      const key = `${category}::${resource}`;
+      if (!byResource.has(key)) {
+        byResource.set(key, { resource, category, tools: new Set(), calls: 0 });
+      }
+      const r = byResource.get(key)!;
+      r.tools.add(tool);
+      r.calls++;
+    }
+  }
+
+  // ── Group by category ───────────────────────────────────────────────────────
+  const categories: Record<Category, ResourceCount[]> = {
+    filesystem: [],
+    url:        [],
+    github:     [],
+    other:      [],
+  };
+
+  for (const rc of byResource.values()) {
+    categories[rc.category].push(rc);
+  }
+  for (const cat of Object.values(categories)) {
+    cat.sort((a, b) => b.calls - a.calls);
+    if (cat.length > topN) cat.splice(topN);
+  }
+
+  const sinceStr = sinceDate.toISOString();
+
+  if (jsonOutput) {
+    const toJson = (cat: ResourceCount[]) =>
+      cat.map(r => ({
+        resource: r.resource,
+        calls:    r.calls,
+        tools:    [...r.tools].sort(),
+      }));
+    console.log(JSON.stringify({
+      since:      sinceStr,
+      totalCalls: total,
+      filesystem: toJson(categories.filesystem),
+      url:        toJson(categories.url),
+      github:     toJson(categories.github),
+      other:      toJson(categories.other),
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  const totalResources = categories.filesystem.length + categories.url.length
+                       + categories.github.length + categories.other.length;
+
+  console.log(`\n${pc.bold('warden scope')} — resource access map`);
+  console.log(pc.dim(`  Since ${sinceStr} · ${total} tool calls · ${totalResources} unique resources`));
+  console.log();
+
+  function printSection(label: string, items: ResourceCount[], colour: (s: string) => string): void {
+    if (items.length === 0) return;
+    console.log(pc.bold(label));
+    for (const r of items) {
+      const toolList = [...r.tools].sort().join(', ');
+      console.log(`  ${colour(r.resource.padEnd(55))} ${pc.dim(String(r.calls).padStart(4) + 'x  ')}${pc.dim(toolList)}`);
+    }
+    console.log();
+  }
+
+  printSection('Filesystem Paths', categories.filesystem, pc.cyan);
+  printSection('URLs', categories.url, pc.blue);
+  printSection('GitHub Repos', categories.github, pc.green);
+  printSection('Other Resources', categories.other, pc.yellow);
+
+  if (totalResources === 0) {
+    console.log(pc.dim('  No resources found in this window. Tool args may not contain path/url fields.'));
+    console.log();
+  }
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -4990,6 +5195,10 @@ async function main(): Promise<void> {
 
     case 'export-html':
       await cmdExportHtml(argv.slice(1));
+      break;
+
+    case 'scope':
+      await cmdScope(argv.slice(1));
       break;
 
     default:
