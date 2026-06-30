@@ -1,0 +1,122 @@
+# Example: How to use agent-warden in your own GitHub Actions CI pipeline.
+#
+# This workflow shows how to run an AI agent session with warden monitoring
+# and automatically gate on safety metrics after the session completes.
+#
+# Copy this file to your project's .github/workflows/ directory and adapt it.
+
+name: Agent Audit Example
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent_task:
+        description: "Task for the AI agent to perform"
+        required: false
+        default: "Review the codebase for issues"
+
+jobs:
+  run-agent-with-warden:
+    runs-on: ubuntu-latest
+
+    env:
+      # Where warden will write its audit log
+      WARDEN_LOG: /tmp/warden-audit.jsonl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install agent-warden
+        run: npm install -g agent-warden
+
+      - name: Initialize warden config
+        run: |
+          warden init
+          # Optionally customize the config:
+          #   warden validate warden.config.yaml
+
+      # Start warden proxy before the agent session
+      # In a real workflow, your AI agent would connect to the MCP proxy
+      # started by `warden run`. See docs/INTEGRATION.md for details.
+
+      - name: Take pre-session snapshot (baseline)
+        run: |
+          # If audit log exists from previous run, snapshot it as baseline
+          if [ -f "$WARDEN_LOG" ]; then
+            warden snapshot --output baseline.json --tag "pre-session"
+          fi
+
+      # ── Your AI agent runs here ───────────────────────────────────────────
+      # Replace this step with your actual agent invocation.
+      # The agent should connect to the warden MCP proxy.
+      - name: Run AI agent (example)
+        run: echo "Replace this step with your actual agent call"
+
+      # ── Safety checks after the agent session ─────────────────────────────
+      - name: Take post-session snapshot
+        if: always()
+        run: |
+          warden snapshot \
+            --output current.json \
+            --tag "post-session-${{ github.run_number }}"
+
+      - name: Run anomaly score check
+        if: always()
+        run: |
+          warden anomaly-score \
+            --window 2 \
+            --json \
+            | tee anomaly-score.json
+          # Fail if score is HIGH or above (≥60)
+          SCORE=$(cat anomaly-score.json | python3 -c "import sys,json; print(json.load(sys.stdin)['score'])")
+          echo "Anomaly score: $SCORE"
+          test "$SCORE" -lt 60
+
+      - name: Run CI safety gate
+        if: always()
+        run: |
+          warden ci-check \
+            --window 2 \
+            --max-deny-rate 30 \
+            --max-score 50 \
+            --json \
+            | tee ci-check.json
+          # warden ci-check exits 1 if any check fails
+
+      - name: Compare against baseline (if exists)
+        if: always()
+        run: |
+          if [ -f baseline.json ] && [ -f current.json ]; then
+            warden compare baseline.json current.json \
+              --fail-on-regression \
+              --json | tee compare-result.json
+          fi
+
+      - name: Generate security summary
+        if: always()
+        run: |
+          warden summary \
+            --window 2 \
+            --title "Agent Session #${{ github.run_number }}" \
+            --output security-summary.txt
+          cat security-summary.txt
+
+      - name: Show trending tools
+        if: always()
+        run: |
+          warden trending --window 2 || true
+
+      - name: Upload audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-audit-${{ github.run_number }}
+          path: |
+            ${{ env.WARDEN_LOG }}
+            current.json
+            anomaly-score.json
+            ci-check.json
+            compare-result.json
+            security-summary.txt
+          if-no-files-found: ignore
+          retention-days: 30

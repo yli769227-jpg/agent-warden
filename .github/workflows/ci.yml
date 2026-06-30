@@ -47,6 +47,17 @@ jobs:
           test -f /tmp/warden.config.yaml
           # validate the generated config
           node $GITHUB_WORKSPACE/dist/cli.js validate /tmp/warden.config.yaml
+          # Smoke test log-analysis commands with empty log
+          LOG=/tmp/warden-smoke-test.jsonl
+          # Write a handful of test entries
+          echo '{"ts":"2026-01-01T10:00:00.000Z","tool":"fs/read","verdict":"allow","durationMs":5}' > $LOG
+          echo '{"ts":"2026-01-01T10:01:00.000Z","tool":"fs/write","verdict":"deny","durationMs":3}' >> $LOG
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js stats --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js profile --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js anomaly-score --window 48 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js summary --window 48 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js snapshot --output /tmp/snap.json --window 48
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js ci-check --window 48 --max-deny-rate 100 --allow-dangerous || true
 
       - name: Upload test results
         if: always() && matrix.node-version == '22.x'
