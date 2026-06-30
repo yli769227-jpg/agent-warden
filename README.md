@@ -2,6 +2,7 @@
 
 > A local MCP audit proxy that logs every tool call, enforces allow/deny policies, and gives you a kill switch — before the agent does something you can't undo.
 
+[![CI](https://github.com/yli769227-jpg/agent-warden/actions/workflows/ci.yml/badge.svg)](https://github.com/yli769227-jpg/agent-warden/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/agent-warden)](https://www.npmjs.com/package/agent-warden)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![MCP compatible](https://img.shields.io/badge/MCP-compatible-blue)](https://modelcontextprotocol.io)
