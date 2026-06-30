@@ -81,6 +81,8 @@ function printUsage(): void {
       `  ${pc.cyan('validate')}          Validate config file and report all errors with field paths`,
       `  ${pc.cyan('alert-test')}        Send a test webhook to all configured targets and report results`,
       `  ${pc.cyan('config-gen')}        Scan Claude Desktop / Claude Code config and generate warden.config.yaml`,
+      `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
+      `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -941,6 +943,264 @@ async function cmdRotate(flags: string[]): Promise<void> {
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
   }
+}
+
+// ─── Command: install / uninstall ─────────────────────────────────────────────
+
+const CLAUDE_CONFIGS: Array<{ label: string; path: string }> = (() => {
+  const home = os.homedir();
+  return [
+    { label: 'Claude Desktop (macOS)',
+      path: path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json') },
+    { label: 'Claude Code (global)',
+      path: path.join(home, '.claude', 'settings.json') },
+    { label: 'Claude Desktop (Linux)',
+      path: path.join(home, '.config', 'Claude', 'claude_desktop_config.json') },
+  ];
+})();
+
+function findClaudeConfigs(): Array<{ label: string; path: string }> {
+  return CLAUDE_CONFIGS.filter(c => fs.existsSync(c.path));
+}
+
+async function cmdInstall(flags: string[]): Promise<void> {
+  // Injects warden as a transparent proxy in front of all existing MCP servers.
+  //
+  // For each discovered MCP server named "X" in the Claude config, install:
+  //   warden → { command: "warden", args: ["run", <configPath>], env: {} }
+  //     pointing to a generated warden.config.yaml that contains X's original def.
+  //
+  // This is conservative: one warden per server, each with its own config file,
+  // so configs are isolated and easy to revert.
+  //
+  // Flags:
+  //   --config-dir <path>   Directory where warden configs are written (default: ~/.warden/configs)
+  //   --dry-run/-n          Preview changes without writing
+  //   --yes/-y              Skip confirmation prompt
+
+  let configDir  = path.join(os.homedir(), '.warden', 'configs');
+  let dryRun     = false;
+  let autoYes    = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--config-dir') && flags[i + 1]) {
+      configDir = flags[++i]!;
+    } else if (f === '--dry-run' || f === '-n') {
+      dryRun = true;
+    } else if (f === '--yes' || f === '-y') {
+      autoYes = true;
+    }
+  }
+
+  const found = findClaudeConfigs();
+  if (found.length === 0) {
+    console.log(pc.yellow('No Claude Desktop or Claude Code config found.'));
+    console.log(pc.dim('  Run: warden config-gen   to generate a warden config manually'));
+    return;
+  }
+
+  console.log(`${pc.bold('Found')} ${found.length} Claude config${found.length > 1 ? 's' : ''}:\n`);
+
+  type Change = {
+    cfgPath:       string;
+    cfgLabel:      string;
+    serverName:    string;
+    originalDef:   Record<string, unknown>;
+    wardenCfgPath: string;
+  };
+
+  const changes: Change[] = [];
+
+  for (const { label, path: cfgPath } of found) {
+    let raw: string;
+    try { raw = fs.readFileSync(cfgPath, 'utf8'); } catch { continue; }
+
+    let parsed: Record<string, unknown>;
+    try { parsed = JSON.parse(raw) as Record<string, unknown>; } catch { continue; }
+
+    const mcpServers = parsed['mcpServers'] as Record<string, unknown> | undefined;
+    if (!mcpServers) { continue; }
+
+    for (const [name, def] of Object.entries(mcpServers)) {
+      if (!def || typeof def !== 'object') continue;
+      const d = def as Record<string, unknown>;
+
+      // Skip if already a warden proxy
+      if (d['command'] === 'warden') continue;
+      if (Array.isArray(d['args']) && (d['args'][0] === 'run' || d['args'][0] === '--')) continue;
+
+      const wardenCfgPath = path.join(configDir, `${name}.yaml`);
+      changes.push({ cfgPath, cfgLabel: label, serverName: name, originalDef: d, wardenCfgPath });
+
+      console.log(`  ${pc.cyan(name)} in ${pc.dim(label)}`);
+      console.log(`    ${pc.dim('Original:')} ${d['command'] ?? '?'} ${Array.isArray(d['args']) ? d['args'].join(' ') : ''}`);
+      console.log(`    ${pc.dim('Warden:  ')} warden run ${wardenCfgPath}`);
+      console.log();
+    }
+  }
+
+  if (changes.length === 0) {
+    console.log(pc.green('✅ All servers are already proxied by warden — nothing to do'));
+    return;
+  }
+
+  if (dryRun) {
+    console.log(pc.dim('(dry run — no files written)'));
+    return;
+  }
+
+  if (!autoYes) {
+    // Simple confirmation without readline (avoid TTY dependencies)
+    process.stdout.write(pc.bold(`Proceed with injecting warden for ${changes.length} server${changes.length > 1 ? 's' : ''}? [y/N] `));
+    const answer = await new Promise<string>((resolve) => {
+      process.stdin.setEncoding('utf8');
+      process.stdin.resume();
+      process.stdin.once('data', (data) => {
+        process.stdin.pause();
+        resolve(String(data).trim().toLowerCase());
+      });
+    });
+    if (answer !== 'y' && answer !== 'yes') {
+      console.log('Aborted.');
+      return;
+    }
+  }
+
+  fs.mkdirSync(configDir, { recursive: true });
+
+  // Group changes by config file so we only rewrite each file once
+  const byConfig = new Map<string, Change[]>();
+  for (const change of changes) {
+    const list = byConfig.get(change.cfgPath) ?? [];
+    list.push(change);
+    byConfig.set(change.cfgPath, list);
+  }
+
+  for (const [cfgPath, cfgChanges] of byConfig) {
+    // Read current state (may differ from what we read above if multiple iters)
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const mcpServers = parsed['mcpServers'] as Record<string, unknown>;
+
+    // Backup original
+    const backupPath = `${cfgPath}.warden-backup`;
+    if (!fs.existsSync(backupPath)) {
+      fs.writeFileSync(backupPath, raw, 'utf8');
+      console.log(pc.dim(`  Backup: ${backupPath}`));
+    }
+
+    // Write per-server warden config + replace entry
+    for (const change of cfgChanges) {
+      // Generate minimal warden.config.yaml for this server
+      const wCfgLines = [
+        `# warden proxy config for: ${change.serverName}`,
+        '# Generated by: warden install',
+        `# Original config: ${change.cfgPath}`,
+        '',
+        'mode: audit',
+        '',
+        'servers:',
+        `  ${change.serverName}:`,
+        `    command: ${JSON.stringify(String(change.originalDef['command']))}`,
+      ];
+      if (Array.isArray(change.originalDef['args']) && change.originalDef['args'].length > 0) {
+        wCfgLines.push(`    args: [${(change.originalDef['args'] as string[]).map(a => JSON.stringify(a)).join(', ')}]`);
+      }
+      if (change.originalDef['env'] && typeof change.originalDef['env'] === 'object') {
+        wCfgLines.push('    env:');
+        for (const [k, v] of Object.entries(change.originalDef['env'] as Record<string, string>)) {
+          wCfgLines.push(`      ${k}: ${JSON.stringify(v)}`);
+        }
+      }
+      wCfgLines.push('', 'policy:', '  defaultAction: allow', '', 'scrubber:', '  enabled: true', '');
+
+      fs.writeFileSync(change.wardenCfgPath, wCfgLines.join('\n'), 'utf8');
+
+      // Replace MCP server entry with warden proxy
+      mcpServers[change.serverName] = {
+        command: 'warden',
+        args:    ['run', change.wardenCfgPath],
+      };
+
+      console.log(`${pc.green('✅')} ${change.serverName}: config written to ${pc.cyan(change.wardenCfgPath)}`);
+    }
+
+    // Write back modified Claude config
+    fs.writeFileSync(cfgPath, JSON.stringify(parsed, null, 2) + '\n', 'utf8');
+    console.log(`${pc.green('✅')} Updated ${pc.cyan(cfgPath)}`);
+  }
+
+  console.log();
+  console.log(pc.bold('Installation complete!'));
+  console.log(`${pc.dim('Restart Claude Desktop / Claude Code to pick up the new config.')}`);
+  console.log(`${pc.dim('To revert:  ')}${pc.cyan('warden uninstall')}`);
+}
+
+async function cmdUninstall(flags: string[]): Promise<void> {
+  // Restores Claude configs from .warden-backup files created by warden install
+  let dryRun  = false;
+  let autoYes = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === '--dry-run' || f === '-n') dryRun = true;
+    if (f === '--yes' || f === '-y')     autoYes = true;
+  }
+
+  const found = findClaudeConfigs();
+  const toRestore: Array<{ original: string; backup: string; label: string }> = [];
+
+  for (const { label, path: cfgPath } of found) {
+    const backup = `${cfgPath}.warden-backup`;
+    if (fs.existsSync(backup)) {
+      toRestore.push({ original: cfgPath, backup, label });
+    }
+  }
+
+  if (toRestore.length === 0) {
+    console.log(pc.yellow('No warden backups found — nothing to uninstall'));
+    console.log(pc.dim('  (Backups are created at <config>.warden-backup by warden install)'));
+    return;
+  }
+
+  console.log(`${pc.bold('Found')} ${toRestore.length} backup${toRestore.length > 1 ? 's' : ''}:\n`);
+  for (const r of toRestore) {
+    console.log(`  ${pc.cyan(r.label)}`);
+    console.log(`    Restore: ${r.backup} → ${r.original}`);
+    console.log();
+  }
+
+  if (dryRun) {
+    console.log(pc.dim('(dry run — no files written)'));
+    return;
+  }
+
+  if (!autoYes) {
+    process.stdout.write(pc.bold(`Restore ${toRestore.length} original config${toRestore.length > 1 ? 's' : ''}? [y/N] `));
+    const answer = await new Promise<string>((resolve) => {
+      process.stdin.setEncoding('utf8');
+      process.stdin.resume();
+      process.stdin.once('data', (data) => {
+        process.stdin.pause();
+        resolve(String(data).trim().toLowerCase());
+      });
+    });
+    if (answer !== 'y' && answer !== 'yes') {
+      console.log('Aborted.');
+      return;
+    }
+  }
+
+  for (const r of toRestore) {
+    fs.copyFileSync(r.backup, r.original);
+    fs.unlinkSync(r.backup);
+    console.log(`${pc.green('✅')} Restored ${pc.cyan(r.original)}`);
+  }
+
+  console.log();
+  console.log(pc.bold('Uninstall complete!'));
+  console.log(pc.dim('Restart Claude Desktop / Claude Code to pick up the restored config.'));
 }
 
 // ─── Command: config-gen ──────────────────────────────────────────────────────
@@ -2269,6 +2529,14 @@ async function main(): Promise<void> {
     case 'config-gen':
     case 'generate':
       await cmdConfigGen(argv.slice(1));
+      break;
+
+    case 'install':
+      await cmdInstall(argv.slice(1));
+      break;
+
+    case 'uninstall':
+      await cmdUninstall(argv.slice(1));
       break;
 
     default:
