@@ -73,6 +73,7 @@ function printUsage(): void {
       `  ${pc.cyan('top')}               Live top-N tools by call count, refreshed every N seconds`,
       `  ${pc.cyan('policy-check')}      Dry-run a tool call through the policy engine without proxying`,
       `  ${pc.cyan('scrub-test')}        Show which fields in a JSON payload would be redacted`,
+      `  ${pc.cyan('report')}            Generate a Markdown audit summary report (--output, --since)`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -926,6 +927,157 @@ async function cmdRotate(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: report ──────────────────────────────────────────────────────────
+
+async function cmdReport(flags: string[]): Promise<void> {
+  // Flags: --output/-o <file.md>, --since/-s <expr>, --title/-t <str>
+  let outputPath: string | undefined;
+  let sinceDate:  Date | undefined;
+  let title      = 'agent-warden Audit Report';
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--output' || f === '-o') && flags[i + 1]) {
+      outputPath = flags[++i];
+    } else if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate = parseSince(flags[++i]!);
+    } else if ((f === '--title' || f === '-t') && flags[i + 1]) {
+      title = flags[++i]!;
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read and aggregate stats ───────────────────────────────────────────────
+  let total = 0;
+  const byVerdict: Record<string, number>                   = {};
+  const byTool:    Record<string, { allow: number; deny: number; killed: number; durations: number[] }> = {};
+  let firstTs: string | undefined;
+  let lastTs:  string | undefined;
+  const recentDenies: Array<{ ts: string; tool: string; reason?: string }> = [];
+
+  const readStream = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl         = readline.createInterface({ input: readStream, crlfDelay: Infinity });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (sinceDate && entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    total++;
+    byVerdict[entry.verdict] = (byVerdict[entry.verdict] ?? 0) + 1;
+
+    if (!byTool[entry.tool]) byTool[entry.tool] = { allow: 0, deny: 0, killed: 0, durations: [] };
+    const ts = byTool[entry.tool]!;
+    if (entry.verdict === 'allow')  ts.allow++;
+    if (entry.verdict === 'deny')   ts.deny++;
+    if (entry.verdict === 'killed') ts.killed++;
+    if (typeof entry.durationMs === 'number') ts.durations.push(entry.durationMs);
+
+    if (!firstTs || entry.ts < firstTs) firstTs = entry.ts;
+    if (!lastTs  || entry.ts > lastTs)  lastTs   = entry.ts;
+
+    if (entry.verdict === 'deny' || entry.verdict === 'killed') {
+      recentDenies.push({
+        ts:     entry.ts ?? '',
+        tool:   entry.tool ?? '',
+        reason: (entry as unknown as Record<string, unknown>)['reason'] as string | undefined,
+      });
+    }
+  }
+
+  const generatedAt = new Date().toISOString();
+  const sinceLabel  = sinceDate
+    ? sinceDate.toISOString()
+    : (firstTs ?? '(no entries)');
+
+  const denyCount   = byVerdict['deny']   ?? 0;
+  const killCount   = byVerdict['killed'] ?? 0;
+  const allowCount  = byVerdict['allow']  ?? 0;
+  const denyRate    = total > 0 ? ((denyCount + killCount) / total * 100).toFixed(1) : '0.0';
+
+  // Top 10 tools by total calls
+  const topTools = Object.entries(byTool)
+    .sort(([, a], [, b]) => (b.allow + b.deny + b.killed) - (a.allow + a.deny + a.killed))
+    .slice(0, 10);
+
+  // ── Render Markdown ────────────────────────────────────────────────────────
+  const md: string[] = [];
+
+  md.push(`# ${title}`);
+  md.push('');
+  md.push(`**Generated:** ${generatedAt}  `);
+  md.push(`**Log file:** \`${logFile}\`  `);
+  if (sinceDate) {
+    md.push(`**Period:** since ${sinceLabel}  `);
+  } else {
+    md.push(`**Period:** ${sinceLabel ?? '—'} → ${lastTs ?? '—'}  `);
+  }
+  md.push('');
+  md.push('---');
+  md.push('');
+  md.push('## Summary');
+  md.push('');
+  md.push('| Metric | Value |');
+  md.push('|---|---|');
+  md.push(`| Total calls | **${total}** |`);
+  md.push(`| Allow | ${allowCount} (${total > 0 ? ((allowCount / total) * 100).toFixed(1) : '0.0'}%) |`);
+  md.push(`| Deny | ${denyCount} (${total > 0 ? ((denyCount / total) * 100).toFixed(1) : '0.0'}%) |`);
+  md.push(`| Killed | ${killCount} (${total > 0 ? ((killCount / total) * 100).toFixed(1) : '0.0'}%) |`);
+  md.push(`| Block rate | **${denyRate}%** |`);
+  md.push('');
+
+  if (topTools.length > 0) {
+    md.push('## Top Tools');
+    md.push('');
+    md.push('| Tool | Total | Allow | Deny | Killed | Avg ms |');
+    md.push('|---|---|---|---|---|---|');
+
+    for (const [tool, s] of topTools) {
+      const toolTotal = s.allow + s.deny + s.killed;
+      const avg = s.durations.length > 0
+        ? Math.round(s.durations.reduce((a, b) => a + b, 0) / s.durations.length)
+        : '—';
+      md.push(`| \`${tool}\` | ${toolTotal} | ${s.allow} | ${s.deny} | ${s.killed} | ${avg} |`);
+    }
+    md.push('');
+  }
+
+  if (recentDenies.length > 0) {
+    const shown = recentDenies.slice(-20);
+    md.push('## Recent Blocked Calls (last 20)');
+    md.push('');
+    md.push('| Timestamp | Tool | Verdict | Reason |');
+    md.push('|---|---|---|---|');
+    for (const d of shown) {
+      md.push(`| ${d.ts} | \`${d.tool}\` | deny/killed | ${d.reason ?? '—'} |`);
+    }
+    md.push('');
+  }
+
+  md.push('---');
+  md.push('');
+  md.push('*Generated by [agent-warden](https://github.com/yli769227-jpg/agent-warden)*');
+  md.push('');
+
+  const content = md.join('\n');
+
+  if (outputPath) {
+    fs.writeFileSync(outputPath, content, 'utf8');
+    console.log(`${pc.green('✅')} Report written to ${pc.cyan(outputPath)}`);
+    console.log(pc.dim(`  ${total} calls · ${denyRate}% block rate`));
+  } else {
+    process.stdout.write(content);
+  }
+}
+
 // ─── Command: scrub-test ──────────────────────────────────────────────────────
 
 async function cmdScrubTest(flags: string[]): Promise<void> {
@@ -1505,6 +1657,10 @@ async function main(): Promise<void> {
     case 'scrub-test':
     case 'scrub':
       await cmdScrubTest(argv.slice(1));
+      break;
+
+    case 'report':
+      await cmdReport(argv.slice(1));
       break;
 
     default:
