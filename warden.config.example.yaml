@@ -220,3 +220,61 @@ scrubber:
 
     # 16-digit sequences that could be payment card numbers (Luhn-range format)
     - "\\b[0-9]{4}[\\s\\-]?[0-9]{4}[\\s\\-]?[0-9]{4}[\\s\\-]?[0-9]{4}\\b"
+
+
+# ---------------------------------------------------------------------------
+# rateLimit  (optional)
+#
+# Per-tool call rate limiting.  Applies before policy rules; a rate-limited
+# call is denied and logged without ever reaching the policy engine or the
+# downstream server.
+#
+# Evaluation order:
+#   1. Kill switch (immediate block)
+#   2. Rate limit (blocks if quota exceeded)
+#   3. Policy rules
+#   4. Forward to downstream
+#
+# Each rule has:
+#   tool:      Exact tool name or glob pattern (same syntax as policy rules).
+#   capacity:  Maximum calls allowed in the window.
+#   windowMs:  Rolling window length in milliseconds.
+#              1 minute  = 60000
+#              5 minutes = 300000
+#              1 hour    = 3600000
+#
+# Per-tool semantics: each matching tool name has its own independent bucket.
+# A rule "github/*" with capacity 5 means each individual github tool may be
+# called up to 5 times per window — calls to different tools do not share the
+# same counter.
+#
+# Omit this section entirely to disable rate limiting.
+# ---------------------------------------------------------------------------
+rateLimit:
+
+  enabled: true
+
+  rules:
+
+    # ── Destructive ops: maximum 3 calls per 5 minutes per tool ──────────────
+    - tool: "*delete*"
+      capacity: 3
+      windowMs: 300000
+
+    - tool: "*destroy*"
+      capacity: 1
+      windowMs: 3600000     # 1 per hour
+
+    - tool: "filesystem/write_file"
+      capacity: 10
+      windowMs: 60000       # 10 writes per minute
+
+    # ── GitHub API: respect the 5000 req/h rate limit ────────────────────────
+    - tool: "github/*"
+      capacity: 30
+      windowMs: 60000       # 30 calls/minute per tool (conservative)
+
+    # ── Global fallback: any tool not matched above ───────────────────────────
+    - tool: "*"
+      capacity: 60
+      windowMs: 60000       # 60 calls/minute per tool (generous default)

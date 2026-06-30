@@ -45,6 +45,30 @@ export interface WardenConfig {
   logFile: string;
   policy: PolicyConfig;
   scrubber: ScrubberConfig;
+  /** Optional per-tool rate limiting. */
+  rateLimit?: RateLimitConfig;
+}
+
+/**
+ * Rate-limiting configuration applied per tool call.
+ */
+export interface RateLimitConfig {
+  enabled: boolean;
+  /** Ordered list of rules; first matching rule's limit is applied. */
+  rules?: RateLimitRule[];
+}
+
+/**
+ * A single rate-limit rule.
+ *
+ * tool:      Exact tool name or glob pattern (e.g. "github/*", "*").
+ * capacity:  Maximum number of calls allowed within windowMs.
+ * windowMs:  Rolling window length in milliseconds.
+ */
+export interface RateLimitRule {
+  tool: string;
+  capacity: number;
+  windowMs: number;
 }
 
 /**

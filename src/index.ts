@@ -7,4 +7,5 @@ export type { AuditLogger } from './audit.js';
 export { createKillSwitch } from './killswitch.js';
 export type { KillSwitch } from './killswitch.js';
 export { loadConfig, resolveConfigPath } from './config.js';
+export { createRateLimiter, RateLimiter, RateLimitError } from './ratelimit.js';
 export * from './types.js';

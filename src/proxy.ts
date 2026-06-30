@@ -30,6 +30,7 @@ import { createPolicyEngine } from './policy.js';
 import { createScrubberFromConfig } from './scrubber.js';
 import { createAuditLogger } from './audit.js';
 import { KillSwitch } from './killswitch.js';
+import { createRateLimiter, RateLimitError } from './ratelimit.js';
 import type { AuditEntry, ServerConfig, WardenConfig } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -69,10 +70,11 @@ export async function runProxy(config: WardenConfig): Promise<void> {
   log('Starting');
 
   // ── Components ─────────────────────────────────────────────────────────────
-  const policy  = createPolicyEngine(config.policy);
-  const scrub   = createScrubberFromConfig(config.scrubber);
-  const audit   = createAuditLogger(config.logFile);
-  const ks      = new KillSwitch();
+  const policy      = createPolicyEngine(config.policy);
+  const scrub       = createScrubberFromConfig(config.scrubber);
+  const audit       = createAuditLogger(config.logFile);
+  const ks          = new KillSwitch();
+  const rateLimiter = config.rateLimit ? createRateLimiter(config.rateLimit) : null;
 
   // Start watching the sentinel file immediately.
   ks.watch();
@@ -193,7 +195,33 @@ export async function runProxy(config: WardenConfig): Promise<void> {
           };
         }
 
-        // ── 2. Policy check ──────────────────────────────────────────────
+        // ── 2. Rate limit check ──────────────────────────────────────────
+        if (rateLimiter) {
+          try {
+            rateLimiter.consume(toolName);
+          } catch (err: unknown) {
+            if (err instanceof RateLimitError) {
+              const rlReason = err.message;
+              const entry: AuditEntry = {
+                ts:         new Date().toISOString(),
+                tool:       toolName,
+                args:       scrubbedArgs,
+                verdict:    'deny',
+                reason:     rlReason,
+                durationMs: Date.now() - startMs,
+              };
+              audit.log(entry);
+              log(`RATE-LIMITED ${toolName} — retry after ${Math.ceil(err.retryAfterMs)}ms`);
+              return {
+                content: [{ type: 'text' as const, text: `[warden] ${rlReason}` }],
+                isError: true,
+              };
+            }
+            throw err;
+          }
+        }
+
+        // ── 3. Policy check ──────────────────────────────────────────────
         const decision = policy.evaluate(toolName, args);
 
         if (config.mode === 'enforce' && decision.action === 'deny') {
@@ -216,7 +244,7 @@ export async function runProxy(config: WardenConfig): Promise<void> {
           };
         }
 
-        // ── 3. Forward to downstream ─────────────────────────────────────
+        // ── 4. Forward to downstream ─────────────────────────────────────
         // Strip the server prefix before forwarding (downstream doesn't know about it)
         const downstreamToolName = prefix ? toolName.slice(prefix.length) : toolName;
         let downstreamResult: Awaited<ReturnType<typeof client.callTool>>;
