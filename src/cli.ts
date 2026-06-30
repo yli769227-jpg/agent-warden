@@ -1434,6 +1434,164 @@ async function cmdScope(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: blame ───────────────────────────────────────────────────────────
+
+async function cmdBlame(flags: string[]): Promise<void> {
+  // Identifies the busiest time buckets in the audit log and reports which
+  // tool(s) were "responsible" (most calls in that bucket).
+  //
+  // Useful for answering: "When was the agent most active, and what was it doing?"
+  //
+  // Algorithm:
+  //   1. Divide the window into fixed-size buckets
+  //   2. Count calls per bucket
+  //   3. Rank buckets by call volume
+  //   4. For each hot bucket, report the top tools driving the activity
+  //
+  // Flags:
+  //   --since/-s <expr>    Start of window
+  //   --window/-w <h>      Window in hours (default 24h)
+  //   --bucket-mins <N>    Bucket size in minutes (default 15)
+  //   --top-buckets <N>    Number of hot buckets to report (default 5)
+  //   --top-tools <N>      Tools per bucket (default 3)
+  //   --json/-j            Machine-readable output
+  //   --threshold <N>      Only report buckets with >= N calls
+
+  let sinceDate: Date | undefined;
+  let windowH       = 24;
+  let bucketMins    = 15;
+  let topBuckets    = 5;
+  let topToolsN     = 3;
+  let jsonOutput    = false;
+  let thresholdCalls = 1;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate     = parseSince(flags[++i]!);
+    } else if ((f === '--window' || f === '-w') && flags[i + 1]) {
+      windowH       = parseFloat(flags[++i]!) || 24;
+    } else if (f === '--bucket-mins' && flags[i + 1]) {
+      bucketMins    = parseInt(flags[++i]!, 10) || 15;
+    } else if (f === '--top-buckets' && flags[i + 1]) {
+      topBuckets    = parseInt(flags[++i]!, 10) || 5;
+    } else if (f === '--top-tools' && flags[i + 1]) {
+      topToolsN     = parseInt(flags[++i]!, 10) || 3;
+    } else if (f === '--threshold' && flags[i + 1]) {
+      thresholdCalls = parseInt(flags[++i]!, 10) || 1;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput    = true;
+    }
+  }
+
+  const windowMs  = windowH * 3_600_000;
+  const effectiveSince = sinceDate ?? new Date(Date.now() - windowMs);
+  const bucketMs  = bucketMins * 60_000;
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read log into buckets ──────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  // bucket index = floor((ts - sinceMs) / bucketMs)
+  const sinceMs    = effectiveSince.getTime();
+  const bucketCalls = new Map<number, { total: number; tools: Record<string, number>; denied: number }>();
+  let   totalCalls  = 0;
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (!entry.ts) continue;
+    const ts = new Date(entry.ts).getTime();
+    if (ts < sinceMs) continue;
+    if (ts > sinceMs + windowMs) continue;
+
+    const bIdx = Math.floor((ts - sinceMs) / bucketMs);
+    if (!bucketCalls.has(bIdx)) {
+      bucketCalls.set(bIdx, { total: 0, tools: {}, denied: 0 });
+    }
+    const b = bucketCalls.get(bIdx)!;
+    b.total++;
+    const tool = entry.tool ?? '(unknown)';
+    b.tools[tool] = (b.tools[tool] ?? 0) + 1;
+    if (entry.verdict === 'deny' || entry.verdict === 'killed') b.denied++;
+    totalCalls++;
+  }
+
+  // ── Rank buckets ──────────────────────────────────────────────────────────
+  const ranked = [...bucketCalls.entries()]
+    .filter(([, b]) => b.total >= thresholdCalls)
+    .sort((a, b) => b[1].total - a[1].total)
+    .slice(0, topBuckets);
+
+  type BucketResult = {
+    bucketStart: string;
+    bucketEnd:   string;
+    calls:       number;
+    denied:      number;
+    topTools:    Array<{ tool: string; calls: number }>;
+  };
+
+  const results: BucketResult[] = ranked.map(([idx, b]) => {
+    const startMs  = sinceMs + idx * bucketMs;
+    const endMs    = startMs + bucketMs;
+    const topT     = Object.entries(b.tools)
+      .sort((a, z) => z[1] - a[1])
+      .slice(0, topToolsN)
+      .map(([tool, calls]) => ({ tool, calls }));
+    return {
+      bucketStart: new Date(startMs).toISOString(),
+      bucketEnd:   new Date(endMs).toISOString(),
+      calls:       b.total,
+      denied:      b.denied,
+      topTools:    topT,
+    };
+  });
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:        effectiveSince.toISOString(),
+      windowH,
+      bucketMins,
+      totalCalls,
+      hotBuckets:   results,
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  console.log(`\n${pc.bold('warden blame')} — top ${topBuckets} activity spikes`);
+  console.log(pc.dim(`  Since ${effectiveSince.toISOString()} · ${windowH}h window · ${bucketMins}min buckets · ${totalCalls} total calls`));
+  console.log();
+
+  if (results.length === 0) {
+    console.log(pc.dim('  No activity above threshold in this window.'));
+    console.log();
+    return;
+  }
+
+  for (const [rank, r] of results.entries()) {
+    const start  = new Date(r.bucketStart);
+    const hhmm   = `${String(start.getUTCHours()).padStart(2, '0')}:${String(start.getUTCMinutes()).padStart(2, '0')} UTC`;
+    const date   = r.bucketStart.slice(0, 10);
+    const denied = r.denied > 0 ? pc.red(` (${r.denied} denied)`) : '';
+    console.log(`  ${pc.bold(`#${rank + 1}`)} ${pc.cyan(date + ' ' + hhmm)} — ${pc.bold(String(r.calls))} calls${denied}`);
+    for (const t of r.topTools) {
+      const bar = '█'.repeat(Math.min(20, Math.ceil(t.calls / r.calls * 20)));
+      console.log(`      ${pc.dim(bar.padEnd(20))}  ${t.tool} (${t.calls})`);
+    }
+    console.log();
+  }
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -5199,6 +5357,10 @@ async function main(): Promise<void> {
 
     case 'scope':
       await cmdScope(argv.slice(1));
+      break;
+
+    case 'blame':
+      await cmdBlame(argv.slice(1));
       break;
 
     default:
