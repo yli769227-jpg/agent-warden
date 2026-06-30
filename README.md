@@ -78,11 +78,28 @@ Claude Code ──stdio──▶ agent-warden ──stdio──▶ filesystem MC
 
 ## Quick Start
 
+**30-second setup with auto-install:**
+
 ```bash
-# Install globally (or use npx without installing)
+# Install globally
 npm install -g agent-warden
 
-# Generate warden.config.yaml in the current directory
+# Auto-detect your existing MCP servers and inject warden in front of them
+warden install
+
+# Restart Claude Desktop or Claude Code
+# That's it — all tool calls are now audited
+```
+
+`warden install` reads your Claude Desktop / Claude Code config, generates a per-server `warden.config.yaml`, and replaces each MCP server entry with a warden proxy. Fully reversible with `warden uninstall`.
+
+**Manual setup:**
+
+```bash
+# Generate warden.config.yaml from your existing Claude config
+warden config-gen
+
+# Or start from a blank template
 warden init
 
 # Verify Warden can connect to all downstream servers
@@ -92,7 +109,7 @@ warden check
 warden run
 ```
 
-**Wire it into Claude Code** by editing `.claude/settings.json`:
+**Wire it into Claude Code manually** by editing `.claude/settings.json`:
 
 ```json
 {
@@ -149,6 +166,12 @@ scrubber:
 | `warden check [config]` | Verify config and probe **all** downstream servers in parallel |
 | `warden bench` | Measure per-call policy+scrubber overhead (`--iterations N`, `--json`) |
 | `warden rotate` | Manually rotate the audit log (`--list`, `--no-compress`) |
+| `warden install` | Auto-inject warden into Claude Desktop / Claude Code (backup + restore) |
+| `warden uninstall` | Restore original MCP config from backup |
+| `warden config-gen` | Scan Claude configs and generate `warden.config.yaml` |
+| `warden validate` | Validate config file and report all errors with field paths |
+| `warden alert-test` | Send test webhook to all configured targets |
+| `warden log --grep` | Real-time log tail with full regex search across all fields |
 | `warden diff` | Compare stats before/after a split point (`--split`, `--window`, `--json`) |
 | `warden top` | Live dashboard — top-N tools by call count, refreshed every interval |
 | `warden watch` | Smart real-time watcher — alerts on bursts, cascading denies, kill events |
@@ -468,6 +491,13 @@ rules:
 - [x] `warden scrub-test` — preview secret redaction on any JSON payload
 - [x] `warden report` — Markdown audit summary for sharing with teams
 - [x] `warden_status` built-in MCP tool — query proxy status from inside a Claude session
+- [x] `warden install` / `warden uninstall` — one-command Claude Desktop integration
+- [x] `warden config-gen` — auto-generate config from existing Claude Desktop/Code setup
+- [x] `warden validate` — deep config validation with field-path errors
+- [x] `warden alert-test` — verify webhook delivery before going live
+- [x] `warden watch` — real-time anomaly detection with configurable thresholds
+- [x] `warden scrub-test` — preview secret scrubbing on any JSON payload
+- [x] `warden log --grep` — regex filter across entire audit entry
 - [ ] Web dashboard — local browser UI to view audit log and visualize call patterns
 - [ ] OPA integration — use Open Policy Agent `.rego` files as the policy engine
 - [ ] OpenTelemetry export — emit audit entries as OTEL spans
@@ -481,7 +511,7 @@ git clone https://github.com/yli769227-jpg/agent-warden.git
 cd agent-warden
 npm install --include=optional
 npm run build
-npm test              # 140 tests (127 unit + 13 integration)
+npm test              # 174 tests (161 unit + 13 integration)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow and PR checklist.
