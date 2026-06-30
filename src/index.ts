@@ -13,4 +13,6 @@ export type { AlertEvent, AlertPayload, WebhookTarget } from './webhook.js';
 export { createLogRotator, LogRotator } from './rotate.js';
 export { WatchAnalyzer } from './watch-analyzer.js';
 export type { WatchAlert, WatchAnalyzerConfig } from './watch-analyzer.js';
+export { validateConfigObject } from './validator.js';
+export type { ValidationIssue } from './validator.js';
 export * from './types.js';
