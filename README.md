@@ -149,6 +149,12 @@ scrubber:
 | `warden check [config]` | Verify config and probe **all** downstream servers in parallel |
 | `warden bench` | Measure per-call policy+scrubber overhead (`--iterations N`, `--json`) |
 | `warden rotate` | Manually rotate the audit log (`--list`, `--no-compress`) |
+| `warden diff` | Compare stats before/after a split point (`--split`, `--window`, `--json`) |
+| `warden top` | Live dashboard — top-N tools by call count, refreshed every interval |
+| `warden watch` | Smart real-time watcher — alerts on bursts, cascading denies, kill events |
+| `warden policy-check` | Dry-run a tool call through the policy engine (`--args`, `--json`) |
+| `warden scrub-test` | Preview which fields in a payload would be redacted (`--input`, `--json`) |
+| `warden report` | Generate a Markdown audit summary (`--output`, `--since`, `--title`) |
 | `warden init` | Generate `warden.config.yaml` in the current directory |
 | `warden version` | Print version |
 
@@ -455,6 +461,13 @@ rules:
 - [x] `warden check` — probes all configured servers in parallel
 - [x] `${VAR}` expansion in server env and webhook targets
 - [x] Log rotation — size + time-based with optional gzip, `warden rotate` command
+- [x] `warden diff` — before/after comparison with configurable split point and window
+- [x] `warden top` — live dashboard, configurable interval and top-N
+- [x] `warden watch` — real-time anomaly detection (burst, deny-streak, kill-switch alerts)
+- [x] `warden policy-check` — dry-run policy evaluation without starting the proxy
+- [x] `warden scrub-test` — preview secret redaction on any JSON payload
+- [x] `warden report` — Markdown audit summary for sharing with teams
+- [x] `warden_status` built-in MCP tool — query proxy status from inside a Claude session
 - [ ] Web dashboard — local browser UI to view audit log and visualize call patterns
 - [ ] OPA integration — use Open Policy Agent `.rego` files as the policy engine
 - [ ] OpenTelemetry export — emit audit entries as OTEL spans
@@ -468,7 +481,7 @@ git clone https://github.com/yli769227-jpg/agent-warden.git
 cd agent-warden
 npm install --include=optional
 npm run build
-npm test              # 124 tests (111 unit + 13 integration)
+npm test              # 140 tests (127 unit + 13 integration)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow and PR checklist.
