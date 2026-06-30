@@ -42,7 +42,7 @@ function printUsage(): void {
       `  ${pc.cyan('run [config]')}      Start the warden proxy (reads config file)`,
       `  ${pc.cyan('kill [reason]')}     Arm the kill switch — all tool calls denied`,
       `  ${pc.cyan('unkill')}            Disarm the kill switch`,
-      `  ${pc.cyan('log')}               Tail the audit log in follow mode (--tool, --verdict, --since, --no-follow)`,
+      `  ${pc.cyan('log')}               Tail the audit log (--tool, --verdict, --since, --no-follow, --json)`,
       `  ${pc.cyan('stats')}             Show audit statistics (counts by verdict / tool)`,
       `  ${pc.cyan('check [config]')}    Verify config and downstream server reachability`,
       `  ${pc.cyan('init')}              Write a starter warden.config.yaml in the current directory`,
@@ -153,6 +153,7 @@ interface LogFilter {
   verdict?: string;
   since?: Date;
   follow: boolean;
+  json: boolean;   // emit raw JSON instead of human-readable output
 }
 
 /** Parses `--since` values: "1h", "30m", "2d", or an ISO-8601 timestamp. */
@@ -189,14 +190,27 @@ function entryMatchesFilter(line: string, filter: LogFilter): boolean {
   return true;
 }
 
+function printLogLine(line: string, filter: LogFilter): void {
+  if (!entryMatchesFilter(line, filter)) return;
+  if (filter.json) {
+    const trimmed = line.trim();
+    if (trimmed) process.stdout.write(trimmed + '\n');
+  } else {
+    const formatted = formatAuditLine(line);
+    if (formatted) console.log(formatted);
+  }
+}
+
 async function cmdLog(flags: string[]): Promise<void> {
-  // Parse flags: --tool <pat>, --verdict <v>, --since <spec>, --no-follow
-  const filter: LogFilter = { follow: true };
+  // Parse flags: --tool, --verdict, --since, --no-follow, --json
+  const filter: LogFilter = { follow: true, json: false };
 
   for (let i = 0; i < flags.length; i++) {
     const f = flags[i]!;
     if (f === '--no-follow' || f === '-n') {
       filter.follow = false;
+    } else if (f === '--json' || f === '-j') {
+      filter.json = true;
     } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
       filter.tool = flags[++i];
     } else if ((f === '--verdict' || f === '-v') && flags[i + 1]) {
@@ -209,9 +223,11 @@ async function cmdLog(flags: string[]): Promise<void> {
   const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
 
   if (!fs.existsSync(logFile)) {
-    console.log(pc.yellow(`Log file not found: ${logFile}`));
+    if (!filter.json) {
+      console.log(pc.yellow(`Log file not found: ${logFile}`));
+    }
     if (!filter.follow) { process.exit(0); }
-    console.log('Waiting for it to be created…');
+    if (!filter.json) console.log('Waiting for it to be created…');
   }
 
   await waitForFile(logFile);
@@ -221,16 +237,16 @@ async function cmdLog(flags: string[]): Promise<void> {
   const rl = readline.createInterface({ input: readStream, crlfDelay: Infinity });
 
   for await (const line of rl) {
-    if (!entryMatchesFilter(line, filter)) continue;
-    const formatted = formatAuditLine(line);
-    if (formatted) console.log(formatted);
+    printLogLine(line, filter);
   }
 
   if (!filter.follow) return;
 
   // ── Follow mode ───────────────────────────────────────────────────────────
   let position = fs.statSync(logFile).size;
-  process.stdout.write(pc.dim('--- following (Ctrl+C to stop) ---\n'));
+  if (!filter.json) {
+    process.stdout.write(pc.dim('--- following (Ctrl+C to stop) ---\n'));
+  }
 
   const watcher = fs.watch(logFile, () => {
     try {
@@ -244,9 +260,7 @@ async function cmdLog(flags: string[]): Promise<void> {
       position = stat.size;
 
       for (const line of buf.toString('utf8').split('\n')) {
-        if (!entryMatchesFilter(line, filter)) continue;
-        const formatted = formatAuditLine(line);
-        if (formatted) console.log(formatted);
+        printLogLine(line, filter);
       }
     } catch {
       // Log file may have been rotated; ignore transient errors.
