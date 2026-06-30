@@ -1592,6 +1592,227 @@ async function cmdBlame(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: session-summary ─────────────────────────────────────────────────
+
+async function cmdSessionSummary(flags: string[]): Promise<void> {
+  // Detects logical "sessions" in the audit log by clustering consecutive
+  // entries with inter-call gaps shorter than --gap-mins.
+  //
+  // For each session, reports:
+  //   - start/end time and duration
+  //   - total, allowed, denied, killed call counts
+  //   - top tools used
+  //   - top file paths accessed (from args.path / args.file keys)
+  //   - risk grade for the session
+  //
+  // Flags:
+  //   --since/-s <expr>    Filter entries (default: last 24h)
+  //   --gap-mins <N>       Gap in minutes that separates sessions (default 10)
+  //   --last <N>           Only show last N sessions (default show all)
+  //   --json/-j            Machine-readable output
+  //   --min-calls <N>      Skip sessions shorter than N calls (default 1)
+
+  let sinceDate: Date | undefined;
+  let gapMins    = 10;
+  let lastN      = 0;
+  let jsonOutput = false;
+  let minCalls   = 1;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if (f === '--gap-mins' && flags[i + 1]) {
+      gapMins    = parseInt(flags[++i]!, 10) || 10;
+    } else if (f === '--last' && flags[i + 1]) {
+      lastN      = parseInt(flags[++i]!, 10) || 0;
+    } else if (f === '--min-calls' && flags[i + 1]) {
+      minCalls   = parseInt(flags[++i]!, 10) || 1;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  if (!sinceDate) sinceDate = new Date(Date.now() - 24 * 3_600_000);
+  const gapMs = gapMins * 60_000;
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read all entries ────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  const entries: AuditEntry[] = [];
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+    if (entry.ts && new Date(entry.ts) >= sinceDate) entries.push(entry);
+  }
+
+  entries.sort((a, b) => {
+    const ta = a.ts ? new Date(a.ts).getTime() : 0;
+    const tb = b.ts ? new Date(b.ts).getTime() : 0;
+    return ta - tb;
+  });
+
+  // ── Cluster into sessions ───────────────────────────────────────────────────
+  type Session = {
+    id:       number;
+    start:    string;
+    end:      string;
+    durationMs: number;
+    calls:    number;
+    allowed:  number;
+    denied:   number;
+    killed:   number;
+    grade:    string;
+    riskScore: number;
+    topTools: Array<{ tool: string; calls: number }>;
+    topPaths: Array<{ path: string; calls: number }>;
+  };
+
+  const PATH_KEYS = new Set(['path', 'file', 'dir', 'filename', 'filepath', 'directory']);
+
+  function extractPaths(args: unknown): string[] {
+    const out: string[] = [];
+    function walk(o: unknown): void {
+      if (typeof o === 'string') {
+        if (/^(\/|\.\/|\.\.\/)/.test(o.trim())) out.push(o.trim());
+        return;
+      }
+      if (Array.isArray(o)) { o.forEach(walk); return; }
+      if (typeof o === 'object' && o !== null) {
+        for (const [k, v] of Object.entries(o as Record<string, unknown>)) {
+          if (PATH_KEYS.has(k.toLowerCase()) && typeof v === 'string' && v.trim().length > 0) {
+            out.push(v.trim());
+          } else { walk(v); }
+        }
+      }
+    }
+    walk(args);
+    return out;
+  }
+
+  function gradeSession(denied: number, killed: number, calls: number): { grade: string; riskScore: number } {
+    const denyRate   = calls > 0 ? denied / calls : 0;
+    const riskScore  = Math.round(denyRate * 40 + (killed > 0 ? 40 : 0) + Math.min(30, denyRate * 60));
+    const grade = riskScore >= 80 ? 'CRITICAL'
+                : riskScore >= 60 ? 'HIGH'
+                : riskScore >= 40 ? 'MEDIUM'
+                : riskScore >= 10 ? 'LOW'
+                : 'CLEAN';
+    return { grade, riskScore };
+  }
+
+  const sessions: Session[] = [];
+  let sessionId  = 0;
+  let current: AuditEntry[] = [];
+  let lastTs = 0;
+
+  function flushSession(): void {
+    if (current.length < minCalls) { current = []; return; }
+    const toolCounts: Record<string, number> = {};
+    const pathCounts: Record<string, number> = {};
+    let allowed = 0, denied = 0, killed = 0;
+
+    for (const e of current) {
+      const t = e.tool ?? '(unknown)';
+      toolCounts[t] = (toolCounts[t] ?? 0) + 1;
+      if (e.verdict === 'allow')       allowed++;
+      else if (e.verdict === 'deny')   denied++;
+      else if (e.verdict === 'killed') killed++;
+      for (const p of extractPaths(e.args)) {
+        pathCounts[p] = (pathCounts[p] ?? 0) + 1;
+      }
+    }
+
+    const startTs = current[0]!.ts ?? '';
+    const endTs   = current[current.length - 1]!.ts ?? '';
+    const durationMs = endTs && startTs
+      ? new Date(endTs).getTime() - new Date(startTs).getTime()
+      : 0;
+
+    const topTools = Object.entries(toolCounts).sort((a, b) => b[1] - a[1]).slice(0, 5)
+      .map(([tool, c]) => ({ tool, calls: c }));
+    const topPaths = Object.entries(pathCounts).sort((a, b) => b[1] - a[1]).slice(0, 5)
+      .map(([path, c]) => ({ path, calls: c }));
+
+    const { grade, riskScore } = gradeSession(denied, killed, current.length);
+
+    sessions.push({
+      id: ++sessionId,
+      start: startTs, end: endTs, durationMs,
+      calls: current.length, allowed, denied, killed,
+      grade, riskScore, topTools, topPaths,
+    });
+    current = [];
+  }
+
+  for (const entry of entries) {
+    const ts = entry.ts ? new Date(entry.ts).getTime() : 0;
+    if (lastTs > 0 && ts - lastTs > gapMs) {
+      flushSession();
+    }
+    current.push(entry);
+    lastTs = ts;
+  }
+  if (current.length > 0) flushSession();
+
+  let displaySessions = sessions;
+  if (lastN > 0) displaySessions = sessions.slice(-lastN);
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:      sinceDate.toISOString(),
+      gapMins,
+      totalSessions: sessions.length,
+      sessions:   displaySessions,
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  const GRADE_COLOUR: Record<string, (s: string) => string> = {
+    CLEAN:    pc.green,
+    LOW:      pc.cyan,
+    MEDIUM:   pc.yellow,
+    HIGH:     (s) => pc.bold(pc.yellow(s)),
+    CRITICAL: (s) => pc.bold(pc.red(s)),
+  };
+
+  console.log(`\n${pc.bold('warden session-summary')} — ${displaySessions.length} of ${sessions.length} sessions`);
+  console.log(pc.dim(`  Since ${sinceDate.toISOString()} · gap=${gapMins}min`));
+  console.log();
+
+  if (displaySessions.length === 0) {
+    console.log(pc.dim('  No sessions found in this window.'));
+    console.log();
+    return;
+  }
+
+  for (const s of displaySessions) {
+    const colour = GRADE_COLOUR[s.grade] ?? pc.white;
+    const dur    = s.durationMs < 60_000
+      ? `${Math.round(s.durationMs / 1000)}s`
+      : `${Math.round(s.durationMs / 60_000)}m`;
+    const denied = s.denied > 0 ? pc.red(` ${s.denied} denied`) : '';
+    const killed = s.killed > 0 ? pc.red(` ${s.killed} killed`) : '';
+    console.log(`  Session #${s.id}  ${colour(`[${s.grade}]`)}  ${pc.dim(s.start.slice(0, 19).replace('T', ' '))} → ${dur}`);
+    console.log(`    ${s.calls} calls${denied}${killed}  ·  tools: ${s.topTools.map(t => t.tool).join(', ')}`);
+    if (s.topPaths.length > 0) {
+      console.log(`    paths: ${s.topPaths.map(p => p.path).join(', ')}`);
+    }
+    console.log();
+  }
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -5361,6 +5582,10 @@ async function main(): Promise<void> {
 
     case 'blame':
       await cmdBlame(argv.slice(1));
+      break;
+
+    case 'session-summary':
+      await cmdSessionSummary(argv.slice(1));
       break;
 
     default:
