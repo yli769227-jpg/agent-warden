@@ -148,6 +148,7 @@ scrubber:
 | `warden export` | Export audit log to CSV (`--output`, `--since`, `--tool`, `--verdict`) |
 | `warden check [config]` | Verify config and probe **all** downstream servers in parallel |
 | `warden bench` | Measure per-call policy+scrubber overhead (`--iterations N`, `--json`) |
+| `warden rotate` | Manually rotate the audit log (`--list`, `--no-compress`) |
 | `warden init` | Generate `warden.config.yaml` in the current directory |
 | `warden version` | Print version |
 
@@ -279,6 +280,36 @@ webhook:
 ```
 
 Delivery is fire-and-forget with exponential retry (default 3 attempts, base 1 s, cap 30 s). A webhook failure never blocks the proxy response path.
+
+---
+
+## Log Rotation
+
+Prevent the audit log from growing forever with size-based or time-based rotation.
+
+```yaml
+rotate:
+  enabled: true
+  maxBytes: 10485760   # rotate at 10 MiB (default)
+  maxAgeMs: 86400000   # also rotate after 24 hours (optional)
+  maxFiles: 5          # keep 5 backups (default)
+  compress: true       # gzip-compress rotated files (default)
+```
+
+Rotation happens automatically at the start of each tool call when either threshold is exceeded. The current log is renamed to `audit.jsonl.1.gz` (and existing backups shifted up), then a fresh log starts. Compression uses gzip — backups are typically 5–10× smaller than the source.
+
+You can also trigger rotation manually at any time:
+
+```bash
+# Rotate now (gzip compressed)
+warden rotate
+
+# Rotate without compressing
+warden rotate --no-compress
+
+# List existing backups
+warden rotate --list
+```
 
 ---
 
@@ -423,8 +454,8 @@ rules:
 - [x] `warden bench` — in-process latency benchmark
 - [x] `warden check` — probes all configured servers in parallel
 - [x] `${VAR}` expansion in server env and webhook targets
+- [x] Log rotation — size + time-based with optional gzip, `warden rotate` command
 - [ ] Web dashboard — local browser UI to view audit log and visualize call patterns
-- [ ] Log rotation — size or time-based JSONL rotation with compression
 - [ ] OPA integration — use Open Policy Agent `.rego` files as the policy engine
 - [ ] OpenTelemetry export — emit audit entries as OTEL spans
 
@@ -437,7 +468,7 @@ git clone https://github.com/yli769227-jpg/agent-warden.git
 cd agent-warden
 npm install --include=optional
 npm run build
-npm test              # 111 tests (98 unit + 13 integration)
+npm test              # 124 tests (111 unit + 13 integration)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow and PR checklist.
