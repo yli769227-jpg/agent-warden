@@ -79,6 +79,7 @@ function printUsage(): void {
       `  ${pc.cyan('report')}            Generate a Markdown audit summary report (--output, --since)`,
       `  ${pc.cyan('watch')}             Smart real-time watcher — alerts on bursts, cascading denies, kill events`,
       `  ${pc.cyan('validate')}          Validate config file and report all errors with field paths`,
+      `  ${pc.cyan('alert-test')}        Send a test webhook to all configured targets and report results`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -929,6 +930,170 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: alert-test ──────────────────────────────────────────────────────
+
+async function cmdAlertTest(flags: string[]): Promise<void> {
+  // Sends a test webhook to all configured targets and reports status
+  // Flags:
+  //   --config/-c <path>   Config file to load
+  //   --url/-u <url>       Send to specific URL (overrides config targets)
+  //   --secret/-s <str>    HMAC secret or static token to use with --url
+  //   --timeout N          HTTP timeout in ms (default 5000)
+  //   --json/-j            Machine-readable output
+
+  let configArg:  string | undefined;
+  let customUrl:  string | undefined;
+  let customSecret: string | undefined;
+  let timeoutMs = 5_000;
+  let jsonOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--config' || f === '-c') && flags[i + 1]) {
+      configArg = flags[++i];
+    } else if ((f === '--url' || f === '-u') && flags[i + 1]) {
+      customUrl = flags[++i];
+    } else if ((f === '--secret' || f === '-s') && flags[i + 1]) {
+      customSecret = flags[++i];
+    } else if (f === '--timeout' && flags[i + 1]) {
+      timeoutMs = parseInt(flags[++i]!, 10);
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  type Target = { url: string; secret?: string; label: string };
+  const targets: Target[] = [];
+
+  if (customUrl) {
+    targets.push({ url: customUrl, secret: customSecret, label: customUrl });
+  } else {
+    // Load from config
+    const origStderr = process.stderr.write.bind(process.stderr);
+    process.stderr.write = () => true;
+    let cfg: ReturnType<typeof loadConfig> | null = null;
+    try {
+      cfg = loadConfig(configArg);
+    } catch { /* config not found */ }
+    process.stderr.write = origStderr;
+
+    if (!cfg) {
+      console.error(pc.red('No config found — pass --config <path> or --url <url>'));
+      process.exit(1);
+    }
+
+    const whCfg = cfg.webhook;
+    if (!whCfg?.enabled) {
+      console.log(pc.yellow('⚠️  Webhook is not enabled in config'));
+      if (!whCfg?.targets?.length) {
+        console.log(pc.dim('   No targets configured either — nothing to test'));
+        process.exit(0);
+      }
+    }
+
+    for (const t of whCfg?.targets ?? []) {
+      targets.push({ url: t.url, secret: t.secret, label: t.url });
+    }
+  }
+
+  if (targets.length === 0) {
+    console.error(pc.red('No webhook targets to test'));
+    process.exit(1);
+  }
+
+  const testPayload = {
+    source:  'agent-warden',
+    version: VERSION,
+    ts:      new Date().toISOString(),
+    event:   'test',
+    tool:    '_alert_test',
+    reason:  'Manual alert test — verifying webhook delivery',
+    args:    {},
+  };
+
+  if (!jsonOutput) {
+    console.log(`${pc.bold('Sending test webhook')} to ${targets.length} target${targets.length > 1 ? 's' : ''}...\n`);
+  }
+
+  type Result = {
+    url: string;
+    ok: boolean;
+    status?: number;
+    error?: string;
+    durationMs: number;
+  };
+
+  const results: Result[] = [];
+
+  for (const target of targets) {
+    const start = performance.now();
+    let result: Result;
+
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'User-Agent':   `agent-warden/${VERSION}`,
+      };
+      if (target.secret) {
+        headers['X-Warden-Secret'] = target.secret;
+      }
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      const resp = await fetch(target.url, {
+        method:  'POST',
+        headers,
+        body:    JSON.stringify(testPayload),
+        signal:  controller.signal,
+      });
+      clearTimeout(timer);
+
+      result = {
+        url:        target.url,
+        ok:         resp.ok,
+        status:     resp.status,
+        durationMs: Math.round(performance.now() - start),
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      result = {
+        url:        target.url,
+        ok:         false,
+        error:      msg.includes('abort') ? `Timeout (>${timeoutMs}ms)` : msg,
+        durationMs: Math.round(performance.now() - start),
+      };
+    }
+
+    results.push(result);
+
+    if (!jsonOutput) {
+      const icon = result.ok ? pc.green('✅') : pc.red('❌');
+      const dur  = pc.dim(`${result.durationMs}ms`);
+      if (result.ok) {
+        console.log(`${icon} ${pc.cyan(result.url)}  HTTP ${result.status}  ${dur}`);
+      } else {
+        const detail = result.error ?? `HTTP ${result.status ?? '?'}`;
+        console.log(`${icon} ${pc.cyan(result.url)}  ${pc.red(detail)}  ${dur}`);
+      }
+    }
+  }
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({ targets: results }, null, 2));
+  } else {
+    console.log();
+    const passed = results.filter(r => r.ok).length;
+    const failed = results.filter(r => !r.ok).length;
+    if (failed === 0) {
+      console.log(pc.green(`✅ All ${passed} target${passed > 1 ? 's' : ''} responded successfully`));
+    } else {
+      console.log(pc.red(`❌ ${failed} of ${results.length} target${results.length > 1 ? 's' : ''} failed`));
+      process.exit(1);
+    }
   }
 }
 
@@ -1916,6 +2081,11 @@ async function main(): Promise<void> {
 
     case 'validate':
       await cmdValidate(argv.slice(1));
+      break;
+
+    case 'alert-test':
+    case 'webhook-test':
+      await cmdAlertTest(argv.slice(1));
       break;
 
     default:
