@@ -23,7 +23,7 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --include=optional
 
       - name: Type check
         run: npx tsc --noEmit
@@ -34,10 +34,25 @@ jobs:
       - name: Unit tests
         run: npm run test:unit -- --passWithNoTests
 
-      - name: Upload coverage
-        if: matrix.node-version == '22.x'
+      - name: Integration tests
+        run: npm run test:integration -- --passWithNoTests
+        timeout-minutes: 3
+
+      - name: Smoke test CLI
+        run: |
+          node dist/cli.js --help
+          node dist/cli.js version
+          # init should create a starter config
+          cd /tmp && node $GITHUB_WORKSPACE/dist/cli.js init
+          test -f /tmp/warden.config.yaml
+          # validate the generated config
+          node $GITHUB_WORKSPACE/dist/cli.js validate /tmp/warden.config.yaml
+
+      - name: Upload test results
+        if: always() && matrix.node-version == '22.x'
         uses: actions/upload-artifact@v4
         with:
-          name: coverage
-          path: coverage/
+          name: test-results
+          path: |
+            coverage/
           if-no-files-found: ignore

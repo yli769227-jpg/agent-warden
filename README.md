@@ -498,6 +498,8 @@ rules:
 - [x] `warden watch` — real-time anomaly detection with configurable thresholds
 - [x] `warden scrub-test` — preview secret scrubbing on any JSON payload
 - [x] `warden log --grep` — regex filter across entire audit entry
+- [x] `warden timeline` — ASCII bar chart of tool call activity over time
+- [x] `warden server-list` — list all available tools across configured MCP servers
 - [ ] Web dashboard — local browser UI to view audit log and visualize call patterns
 - [ ] OPA integration — use Open Policy Agent `.rego` files as the policy engine
 - [ ] OpenTelemetry export — emit audit entries as OTEL spans
@@ -511,7 +513,7 @@ git clone https://github.com/yli769227-jpg/agent-warden.git
 cd agent-warden
 npm install --include=optional
 npm run build
-npm test              # 174 tests (161 unit + 13 integration)
+npm test              # 185 tests (172 unit + 13 integration)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow and PR checklist.
