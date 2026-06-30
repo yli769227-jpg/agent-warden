@@ -155,30 +155,72 @@ scrubber:
 
 ## Commands
 
+### Proxy
+
 | Command | Description |
 |---|---|
 | `warden run [config]` | Start the proxy in stdio mode |
 | `warden kill [reason]` | Arm the kill switch — all tool calls denied immediately |
 | `warden unkill` | Disarm the kill switch and resume normal proxying |
+
+### Configuration
+
+| Command | Description |
+|---|---|
+| `warden init` | Generate `warden.config.yaml` in the current directory |
+| `warden validate [config]` | Validate config file and report all errors with field paths |
+| `warden config-gen` | Scan Claude Desktop / Claude Code configs and generate `warden.config.yaml` |
+| `warden install` | Auto-inject warden into Claude Desktop / Claude Code (backup + restore) |
+| `warden uninstall` | Restore original MCP config from backup |
+| `warden check [config]` | Verify config and probe **all** downstream servers in parallel |
+| `warden doctor` | Run a diagnostic health check (Node version, config, kill switch, log) |
+
+### Audit Log
+
+| Command | Description |
+|---|---|
 | `warden log` | Stream the audit log (`--tool`, `--verdict`, `--since`, `--tail N`, `--no-follow`, `--json`) |
 | `warden stats` | Print tool call counts, deny rates, avg latency (`--since`, `--json`) |
 | `warden export` | Export audit log to CSV (`--output`, `--since`, `--tool`, `--verdict`) |
-| `warden check [config]` | Verify config and probe **all** downstream servers in parallel |
-| `warden bench` | Measure per-call policy+scrubber overhead (`--iterations N`, `--json`) |
 | `warden rotate` | Manually rotate the audit log (`--list`, `--no-compress`) |
-| `warden install` | Auto-inject warden into Claude Desktop / Claude Code (backup + restore) |
-| `warden uninstall` | Restore original MCP config from backup |
-| `warden config-gen` | Scan Claude configs and generate `warden.config.yaml` |
-| `warden validate` | Validate config file and report all errors with field paths |
-| `warden alert-test` | Send test webhook to all configured targets |
-| `warden log --grep` | Real-time log tail with full regex search across all fields |
+
+### Analysis
+
+| Command | Description |
+|---|---|
 | `warden diff` | Compare stats before/after a split point (`--split`, `--window`, `--json`) |
+| `warden timeline` | ASCII bar chart of tool call activity over time (`--bucket`, `--split-verdict`, `--tool`) |
+| `warden trending` | Show rising/falling tool call rates across two halves of a window (`--window`, `--json`) |
 | `warden top` | Live dashboard — top-N tools by call count, refreshed every interval |
 | `warden watch` | Smart real-time watcher — alerts on bursts, cascading denies, kill events |
+| `warden profile` | Tool call distribution and session behavioural fingerprint (`--since`, `--json`) |
+
+### Intelligence
+
+| Command | Description |
+|---|---|
+| `warden anomaly-score` | Compute a 0–100 risk score (`--window`, `--threshold`, `--json`) |
+| `warden suggest` | Analyse audit log and suggest policy rules (`--since`, `--yaml`, `--json`) |
+| `warden report` | Generate a Markdown audit summary (`--output`, `--since`, `--title`) |
+| `warden summary` | Plain-English security summary for stakeholders (`--since`, `--title`, `--output`, `--json`) |
+
+### CI/CD
+
+| Command | Description |
+|---|---|
+| `warden snapshot` | Save a timestamped JSON snapshot of current audit stats (`--output`, `--tag`, `--print`) |
+| `warden compare` | Compare two snapshots and detect regressions (`--json`, `--fail-on-regression`) |
+| `warden ci-check` | Run all CI safety checks, exit 1 if any fail (`--max-deny-rate`, `--max-score`, `--baseline`) |
+| `warden replay` | Re-evaluate historical entries against current policy (`--config`, `--diff-only`, `--json`) |
+| `warden bench` | Measure per-call policy+scrubber overhead (`--iterations N`, `--json`) |
+
+### Debugging
+
+| Command | Description |
+|---|---|
 | `warden policy-check` | Dry-run a tool call through the policy engine (`--args`, `--json`) |
 | `warden scrub-test` | Preview which fields in a payload would be redacted (`--input`, `--json`) |
-| `warden report` | Generate a Markdown audit summary (`--output`, `--since`, `--title`) |
-| `warden init` | Generate `warden.config.yaml` in the current directory |
+| `warden alert-test` | Send test webhook to all configured targets (`--url`, `--json`) |
 | `warden version` | Print version |
 
 ---
