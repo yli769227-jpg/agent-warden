@@ -1,0 +1,104 @@
+/**
+ * Top-level warden configuration.
+ *
+ * mode:
+ *   'audit'   – log every intercepted call but always forward it downstream.
+ *   'enforce' – apply policy rules; deny/kill actions are enforced.
+ */
+export interface WardenConfig {
+  mode: 'audit' | 'enforce';
+  /**
+   * Shell command (and arguments) used to spawn the downstream MCP server
+   * process.  The first element is the executable; remaining elements are
+   * the arguments.
+   */
+  downstreamCommand: string[];
+  /** Absolute or relative path to the JSONL audit log file. */
+  logFile: string;
+  policy: PolicyConfig;
+  scrubber: ScrubberConfig;
+}
+
+/**
+ * Policy configuration applied to every intercepted tools/call.
+ */
+export interface PolicyConfig {
+  /** Fallback verdict when no rule matches the tool name. */
+  defaultAction: 'allow' | 'deny';
+  /** Ordered list of rules; first match wins. */
+  rules?: PolicyRule[];
+  /**
+   * Working directory used for out-of-cwd filesystem-write checks.
+   * Defaults to process.cwd() when omitted.
+   */
+  cwd?: string;
+  /**
+   * Warden operating mode forwarded from WardenConfig.  When 'enforce',
+   * dangerous tool calls are denied; when 'audit' they are allowed with a
+   * warning.  Defaults to 'audit'.
+   */
+  mode?: 'audit' | 'enforce';
+}
+
+/**
+ * A single policy rule.
+ *
+ * tool:   Exact tool name or minimatch glob (e.g. "bash", "fs/*", "*").
+ * action: Verdict to apply when the rule matches.
+ * reason: Optional human-readable explanation recorded in the audit log.
+ */
+export interface PolicyRule {
+  tool: string;
+  action: 'allow' | 'deny';
+  reason?: string;
+}
+
+/**
+ * Configuration for the secret-scrubbing layer applied before log writes.
+ */
+export interface ScrubberConfig {
+  enabled: boolean;
+  /**
+   * Additional regex patterns (as strings) to redact from logged payloads.
+   * Built-in patterns (API keys, tokens, passwords, etc.) are always applied
+   * when enabled is true.
+   */
+  patterns?: string[];
+}
+
+/**
+ * A single line written to the JSONL audit log.
+ */
+export interface AuditEntry {
+  /** ISO-8601 timestamp of when the call was intercepted. */
+  ts: string;
+  /** Name of the MCP tool that was called. */
+  tool: string;
+  /** Scrubbed copy of the arguments passed to the tool. */
+  args: unknown;
+  /** Policy verdict or kill-switch outcome. */
+  verdict: 'allow' | 'deny' | 'killed';
+  /** Human-readable explanation for the verdict. */
+  reason?: string;
+  /** Round-trip latency in milliseconds (only present for forwarded calls). */
+  durationMs?: number;
+  /** Serialised error message if the downstream call failed. */
+  error?: string;
+}
+
+/**
+ * Persistent kill-switch state shared across all active warden instances.
+ *
+ * When killed is true, all tools/call messages are denied immediately
+ * without being forwarded, regardless of policy rules.
+ */
+export interface KillSwitchState {
+  /** True when the sentinel file exists and the kill switch is active. */
+  killed: boolean;
+  /** Reason the kill switch was activated. */
+  reason?: string;
+  /** ISO-8601 timestamp of activation. */
+  killedAt?: string;
+  /** Absolute path to the sentinel file being watched. */
+  path?: string;
+}

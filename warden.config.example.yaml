@@ -1,0 +1,207 @@
+# warden.config.example.yaml
+# ---------------------------------------------------------------------------
+# Full reference configuration for agent-warden.
+# Every supported field is present with an explanatory inline comment.
+#
+# Resolution order (warden looks for a config file in this order):
+#   1. Path passed explicitly to `warden run <path>`
+#   2. WARDEN_CONFIG environment variable
+#   3. ./warden.config.yaml  (current working directory)
+#   4. ~/.warden/config.yaml (home fallback)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# mode  (required-ish — defaults to "audit" when omitted)
+#
+# "audit"   — Every intercepted tools/call is logged and then forwarded
+#             downstream unconditionally.  Policy rules and built-in dangerous
+#             patterns are evaluated and recorded in the audit log, but they
+#             never block a call.  Use this in development so you can see what
+#             an agent does before writing enforcement rules.
+#
+# "enforce" — Policy rules are authoritative.  A "deny" verdict stops the call
+#             right here; the downstream server never sees it.  Built-in
+#             dangerous-keyword matches also block in this mode.  Use this in
+#             production.
+# ---------------------------------------------------------------------------
+mode: enforce          # switch to "audit" while iterating on policy rules
+
+
+# ---------------------------------------------------------------------------
+# logFile  (optional — defaults to ~/.warden/audit.jsonl)
+#
+# Absolute or relative path to the JSONL audit log.  Each line is a single
+# JSON object (AuditEntry) containing: ts, tool, args (scrubbed), verdict,
+# reason, durationMs, error.
+#
+# Leading "~/" is expanded to the current user's home directory at load time.
+# The parent directory is created automatically when warden first writes a
+# log entry.
+#
+# Rotate or compress old logs externally (e.g. logrotate); warden appends
+# indefinitely.
+# ---------------------------------------------------------------------------
+logFile: ~/.warden/audit.jsonl   # absolute path is also fine: /var/log/warden/audit.jsonl
+
+
+# ---------------------------------------------------------------------------
+# downstreamCommand  (REQUIRED — warden throws a descriptive error if absent)
+#
+# The MCP server that warden proxies.  Provide the full command as a YAML
+# sequence: first item is the executable, remaining items are argv.
+#
+# The example below wraps the official @modelcontextprotocol/server-filesystem
+# package.  The final argument is the root directory the server is allowed to
+# read/write.  Pass multiple allowed paths as additional items.
+#
+# Tips:
+#   • Use `npx -y` so the package is auto-installed if not already cached.
+#   • Pass an absolute path for the allowed root to avoid cwd-relative
+#     ambiguity.
+#   • For a locally built server use ["node", "dist/index.js"] instead.
+# ---------------------------------------------------------------------------
+downstreamCommand:
+  - npx
+  - -y
+  - "@modelcontextprotocol/server-filesystem"
+  - /Users/alice/projects/my-app    # root the server is allowed to access
+
+
+# ---------------------------------------------------------------------------
+# policy
+#
+# Controls which tools/call invocations are forwarded to the downstream server
+# and which are blocked.
+#
+# Evaluation order:
+#   1. Explicit rules (first match wins; supports "*" glob)
+#   2. Built-in dangerous patterns (keyword match on tool name, or filesystem
+#      write targeting a path outside the process cwd)
+#   3. defaultAction fall-through
+# ---------------------------------------------------------------------------
+policy:
+
+  # defaultAction  ("allow" | "deny")
+  #
+  # The verdict applied when no explicit rule matches and the built-in
+  # dangerous-pattern checks do not trigger.
+  #
+  # "allow"  — permissive default; useful when you want to deny only a known
+  #            bad set of tools (denylist approach).
+  # "deny"   — strict default; every tool must be explicitly allowed
+  #            (allowlist approach).
+  #
+  # For a filesystem proxy serving read-only workflows, "allow" with explicit
+  # deny rules for write tools is a reasonable starting point.
+  defaultAction: allow
+
+  # rules  (ordered list; first match wins)
+  #
+  # Each rule has three fields:
+  #   tool    — Exact tool name OR a minimatch-style glob.  The only wildcard
+  #             supported is "*" (matches zero or more characters).  Match is
+  #             case-sensitive.
+  #   action  — "allow" | "deny"
+  #   reason  — Optional human-readable string recorded in every audit entry
+  #             that this rule produces.  Helpful for post-hoc analysis.
+  rules:
+
+    # ── Explicit allow: safe read-only filesystem tools ───────────────────────
+    - tool: read_file
+      action: allow
+      reason: "Read access is always permitted for this project"
+
+    - tool: list_directory
+      action: allow
+      reason: "Directory listing is safe and read-only"
+
+    - tool: get_file_info
+      action: allow
+      reason: "Metadata queries carry no side effects"
+
+    - tool: search_files
+      action: allow
+      reason: "Search is read-only"
+
+    # ── Explicit deny: dangerous write / destructive tools ────────────────────
+    - tool: write_file
+      action: deny
+      reason: "Filesystem writes require explicit human approval — use the editor instead"
+
+    - tool: create_directory
+      action: deny
+      reason: "Directory creation must be reviewed before execution"
+
+    - tool: move_file
+      action: deny
+      reason: "Move operations can cause irreversible data loss"
+
+    - tool: delete_file
+      action: deny
+      reason: "Deletion is irreversible — blocked unconditionally"
+
+    # ── Explicit deny: shell / code execution ─────────────────────────────────
+    - tool: bash
+      action: deny
+      reason: "Arbitrary shell access is disabled in production"
+
+    - tool: execute_command
+      action: deny
+      reason: "Command execution requires an explicit policy exception"
+
+    # ── Glob deny: any tool whose name ends with _write ───────────────────────
+    - tool: "*_write"
+      action: deny
+      reason: "Catch-all for any MCP server that names write tools with _write suffix"
+
+    # ── Glob deny: any tool whose name starts with admin_ ─────────────────────
+    - tool: "admin_*"
+      action: deny
+      reason: "Administrative tools are never permitted from an automated agent"
+
+
+# ---------------------------------------------------------------------------
+# scrubber
+#
+# Redacts secrets from tool arguments before they are written to the audit
+# log.  The scrubber runs on every intercepted call regardless of verdict.
+#
+# Built-in patterns (always active when enabled: true):
+#   • AWS access-key IDs  (AKIA…)
+#   • Generic key/secret/token/password assignments in quoted strings
+#   • PEM private keys
+#   • GitHub personal-access / fine-grained / OAuth tokens  (ghp_, gho_, …)
+#   • HTTP Authorization: Bearer …
+#   • .env-style KEY=<long-mixed-char-value> lines
+#
+# Matched text is replaced with the literal token [REDACTED] in the log.
+# The original value is never written to disk.
+# ---------------------------------------------------------------------------
+scrubber:
+
+  # enabled  (true | false)
+  #
+  # Set to false only in controlled environments where you need to inspect raw
+  # argument payloads for debugging.  Never disable in production.
+  enabled: true
+
+  # patterns  (optional list of additional regex source strings)
+  #
+  # Each string is compiled with the "g" flag and applied on top of the
+  # built-in set.  Use JavaScript regex syntax.  Double-escape backslashes
+  # because the value is a YAML string first, then a regex source string.
+  #
+  # Examples below show three common additions:
+  #   1. Internal service tokens that follow a project-specific prefix
+  #   2. Database connection strings containing credentials
+  #   3. Numeric card / account numbers (PCI scope)
+  patterns:
+    # Internal API tokens issued by your own auth service (e.g. "svc_abc123…")
+    - "svc_[A-Za-z0-9]{32,}"
+
+    # PostgreSQL / MySQL connection strings with embedded credentials
+    - "(?:postgres|mysql)://[^:]+:[^@]+@[^/\\s]+"
+
+    # 16-digit sequences that could be payment card numbers (Luhn-range format)
+    - "\\b[0-9]{4}[\\s\\-]?[0-9]{4}[\\s\\-]?[0-9]{4}[\\s\\-]?[0-9]{4}\\b"
