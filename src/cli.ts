@@ -84,6 +84,7 @@ function printUsage(): void {
       `  ${pc.cyan('server-list')}        Connect to all configured servers and list available tools`,
       `  ${pc.cyan('timeline')}           ASCII timeline of tool calls grouped by time bucket`,
       `  ${pc.cyan('doctor')}             Full health check of warden installation and config`,
+      `  ${pc.cyan('suggest')}            Analyse audit log and suggest policy rules`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -987,6 +988,212 @@ async function cmdRotate(flags: string[]): Promise<void> {
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
   }
+}
+
+// ─── Command: suggest ─────────────────────────────────────────────────────────
+
+async function cmdSuggest(flags: string[]): Promise<void> {
+  // Analyse the audit log and suggest policy rules based on observed patterns.
+  //
+  // Strategy:
+  //  1. Count allow/deny verdicts per tool (from actual logged calls)
+  //  2. Flag tools that:
+  //     - Are frequently denied  → suggest explicit deny rule
+  //     - Are always allowed and very common → suggest explicit allow rule
+  //     - Match dangerous-tool name patterns → suggest review / deny rule
+  //  3. Identify tools called with suspiciously high frequency → suggest rate limit
+  //  4. Output as YAML policy snippet or JSON
+  //
+  // Flags:
+  //   --since/-s <expr>      Look at entries since this point (default: all)
+  //   --min-calls <N>        Minimum total calls to include a tool (default: 3)
+  //   --deny-ratio <0-1>     Ratio of deny/(allow+deny) to suggest deny rule (default: 0.3)
+  //   --json/-j              Machine-readable JSON output
+  //   --yaml/-y              Output as YAML policy snippet (default: text)
+
+  let sinceDate:  Date | undefined;
+  let minCalls    = 3;
+  let denyRatio   = 0.3;
+  let jsonOutput  = false;
+  let yamlOutput  = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate = parseSince(flags[++i]!);
+    } else if (f === '--min-calls' && flags[i + 1]) {
+      minCalls = parseInt(flags[++i]!, 10) || minCalls;
+    } else if (f === '--deny-ratio' && flags[i + 1]) {
+      denyRatio = parseFloat(flags[++i]!) || denyRatio;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if (f === '--yaml' || f === '-y') {
+      yamlOutput = true;
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read audit log ────────────────────────────────────────────────────────
+  const toolStats: Map<string, { allow: number; deny: number; killed: number; durations: number[] }> = new Map();
+
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (sinceDate && entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    const t = entry.tool ?? '(unknown)';
+    if (!toolStats.has(t)) toolStats.set(t, { allow: 0, deny: 0, killed: 0, durations: [] });
+    const s = toolStats.get(t)!;
+    if (entry.verdict === 'allow')  s.allow++;
+    if (entry.verdict === 'deny')   s.deny++;
+    if (entry.verdict === 'killed') s.killed++;
+    if (typeof entry.durationMs === 'number') s.durations.push(entry.durationMs);
+  }
+
+  // ── Dangerous pattern heuristics ──────────────────────────────────────────
+  // These are tools whose names suggest destructive or sensitive operations.
+  const DANGEROUS_PATTERNS = [
+    /delete/i, /remove/i, /destroy/i, /drop/i, /truncate/i,
+    /purge/i, /reset/i, /wipe/i, /overwrite/i, /bash/i, /shell/i, /exec/i,
+    /sudo/i, /chmod/i, /chown/i, /format/i, /rm\b/i, /kill/i,
+  ];
+
+  function isDangerous(name: string): boolean {
+    return DANGEROUS_PATTERNS.some(re => re.test(name));
+  }
+
+  // ── Build suggestions ─────────────────────────────────────────────────────
+  interface Suggestion {
+    tool:    string;
+    action:  'deny' | 'allow' | 'rate-limit';
+    reason:  string;
+    urgency: 'high' | 'medium' | 'low';
+    stats:   { allow: number; deny: number; killed: number; total: number; denyRate: number };
+  }
+
+  const suggestions: Suggestion[] = [];
+
+  for (const [tool, stats] of toolStats.entries()) {
+    const total   = stats.allow + stats.deny + stats.killed;
+    if (total < minCalls) continue;
+
+    const denyRate = (stats.deny + stats.killed) / total;
+
+    // High deny rate → suggest explicit deny rule
+    if (denyRate >= denyRatio) {
+      suggestions.push({
+        tool,
+        action:  'deny',
+        reason:  `High block rate: ${(denyRate * 100).toFixed(0)}% of ${total} calls were blocked`,
+        urgency: denyRate >= 0.7 ? 'high' : 'medium',
+        stats:   { ...stats, total, denyRate },
+      });
+      continue;
+    }
+
+    // Dangerous-pattern tool that was allowed → flag for review
+    if (isDangerous(tool) && stats.allow > 0) {
+      suggestions.push({
+        tool,
+        action:  'deny',
+        reason:  `Tool name matches dangerous-operation pattern — review whether to allow`,
+        urgency: 'medium',
+        stats:   { ...stats, total, denyRate },
+      });
+      continue;
+    }
+
+    // High call volume, all allowed → suggest explicit allow rule + rate limit
+    const callsPerEntry = total;
+    if (callsPerEntry >= minCalls * 3 && denyRate === 0) {
+      const avgMs = stats.durations.length > 0
+        ? Math.round(stats.durations.reduce((a, b) => a + b, 0) / stats.durations.length)
+        : null;
+      suggestions.push({
+        tool,
+        action:  'rate-limit',
+        reason:  `High call volume (${total} calls, all allowed). Consider rate-limiting to prevent runaway use.${avgMs != null ? ` Avg latency: ${avgMs}ms` : ''}`,
+        urgency: 'low',
+        stats:   { ...stats, total, denyRate },
+      });
+    }
+  }
+
+  // Sort by urgency
+  const urgencyOrder = { high: 0, medium: 1, low: 2 };
+  suggestions.sort((a, b) => (urgencyOrder[a.urgency] - urgencyOrder[b.urgency]) || (b.stats.total - a.stats.total));
+
+  if (suggestions.length === 0) {
+    if (jsonOutput) {
+      console.log(JSON.stringify({ suggestions: [], note: 'No suggestions — policy looks healthy or not enough data' }, null, 2));
+    } else {
+      console.log(pc.green('✅ No suggestions — policy looks healthy or insufficient data (need ≥' + minCalls + ' calls per tool)'));
+    }
+    return;
+  }
+
+  // ── JSON output ────────────────────────────────────────────────────────────
+  if (jsonOutput) {
+    console.log(JSON.stringify({ suggestions }, null, 2));
+    return;
+  }
+
+  // ── YAML snippet output ────────────────────────────────────────────────────
+  if (yamlOutput) {
+    console.log('# agent-warden suggested policy rules');
+    console.log('# Generated by: warden suggest');
+    console.log('# Review each rule before adding to warden.config.yaml');
+    console.log('');
+    console.log('policy:');
+    console.log('  rules:');
+    for (const s of suggestions) {
+      if (s.action === 'rate-limit') {
+        console.log(`    # ${s.reason}`);
+        console.log(`    # Consider adding to rateLimit.rules instead`);
+      } else {
+        console.log(`    # ${s.urgency.toUpperCase()}: ${s.reason}`);
+        console.log(`    - tool: "${s.tool}"`);
+        console.log(`      action: ${s.action}`);
+        console.log(`      reason: "Auto-suggested: ${s.reason.split('.')[0]}"`);
+      }
+      console.log('');
+    }
+    return;
+  }
+
+  // ── Text output ────────────────────────────────────────────────────────────
+  const urgencyIcon = { high: pc.red('❗'), medium: pc.yellow('⚠️ '), low: pc.dim('💡') };
+
+  console.log(`${pc.bold('warden suggest')} — ${suggestions.length} suggestion${suggestions.length > 1 ? 's' : ''} from audit log`);
+  if (sinceDate) console.log(pc.dim(`  since ${sinceDate.toISOString()}`));
+  console.log();
+
+  for (const s of suggestions) {
+    const icon  = urgencyIcon[s.urgency];
+    const label = s.action === 'rate-limit'
+      ? pc.blue('[rate-limit]')
+      : s.action === 'deny'
+        ? pc.red('[deny]')
+        : pc.green('[allow]');
+
+    console.log(`  ${icon} ${pc.cyan(s.tool)}  ${label}`);
+    console.log(`     ${s.reason}`);
+    console.log(`     ${pc.dim(`Calls: ${s.stats.total} (allow: ${s.stats.allow}, deny: ${s.stats.deny}, killed: ${s.stats.killed})`)}`);
+    console.log();
+  }
+
+  console.log(pc.dim('Run `warden suggest --yaml` to output a policy snippet you can paste into warden.config.yaml'));
 }
 
 // ─── Command: doctor ──────────────────────────────────────────────────────────
@@ -3066,6 +3273,10 @@ async function main(): Promise<void> {
 
     case 'doctor':
       await cmdDoctor(argv.slice(1));
+      break;
+
+    case 'suggest':
+      await cmdSuggest(argv.slice(1));
       break;
 
     default:
