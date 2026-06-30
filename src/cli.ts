@@ -87,6 +87,7 @@ function printUsage(): void {
       `  ${pc.cyan('suggest')}            Analyse audit log and suggest policy rules`,
       `  ${pc.cyan('snapshot')}           Save a timestamped JSON snapshot of current audit stats`,
       `  ${pc.cyan('compare')}            Compare two snapshot files and show regressions`,
+      `  ${pc.cyan('trending')}           Show which tools are rising or falling in call rate`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -989,6 +990,130 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: trending ────────────────────────────────────────────────────────
+
+async function cmdTrending(flags: string[]): Promise<void> {
+  // Shows tools sorted by change in call rate between two halves of a time window.
+  // "Rising" = more calls in second half than first half.
+  // "Falling" = fewer calls in second half than first half.
+  //
+  // Flags:
+  //   --window/-w <hours>    Total window to analyse in hours (default 24)
+  //   --n <count>            Max number of tools to show per list (default 10)
+  //   --json/-j              Machine-readable output
+  //   --min-calls N          Minimum total calls to appear in list (default 2)
+
+  let windowHours = 24;
+  let maxN         = 10;
+  let jsonOutput   = false;
+  let minCalls     = 2;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--window' || f === '-w') && flags[i + 1]) {
+      windowHours = parseFloat(flags[++i]!);
+    } else if (f === '--n' && flags[i + 1]) {
+      maxN = parseInt(flags[++i]!, 10);
+    } else if ((f === '--json' || f === '-j')) {
+      jsonOutput = true;
+    } else if (f === '--min-calls' && flags[i + 1]) {
+      minCalls = parseInt(flags[++i]!, 10);
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Load entries in the window ─────────────────────────────────────────────
+  const now     = Date.now();
+  const windowMs = windowHours * 60 * 60 * 1000;
+  const cutoff   = now - windowMs;
+  const midpoint = now - windowMs / 2;
+
+  const toolFirst:  Record<string, number> = {};  // calls in first half
+  const toolSecond: Record<string, number> = {};  // calls in second half
+
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    const ts = entry.ts ? new Date(entry.ts).getTime() : 0;
+    if (ts < cutoff) continue;
+
+    const tool = entry.tool ?? '(unknown)';
+    if (ts < midpoint) {
+      toolFirst[tool] = (toolFirst[tool] ?? 0) + 1;
+    } else {
+      toolSecond[tool] = (toolSecond[tool] ?? 0) + 1;
+    }
+  }
+
+  // ── Compute deltas ─────────────────────────────────────────────────────────
+  const allTools = new Set([...Object.keys(toolFirst), ...Object.keys(toolSecond)]);
+
+  const trends = Array.from(allTools).map(tool => {
+    const first  = toolFirst[tool]  ?? 0;
+    const second = toolSecond[tool] ?? 0;
+    const total  = first + second;
+    const delta  = second - first;
+    const pct    = first === 0
+      ? (second > 0 ? 100 : 0)
+      : Math.round((delta / first) * 100);
+    return { tool, first, second, total, delta, pct };
+  }).filter(t => t.total >= minCalls);
+
+  const rising  = trends.filter(t => t.delta > 0).sort((a, b) => b.delta - a.delta).slice(0, maxN);
+  const falling = trends.filter(t => t.delta < 0).sort((a, b) => a.delta - b.delta).slice(0, maxN);
+  const flat    = trends.filter(t => t.delta === 0).sort((a, b) => b.total - a.total).slice(0, maxN);
+
+  // ── Output ─────────────────────────────────────────────────────────────────
+  if (jsonOutput) {
+    console.log(JSON.stringify({ windowHours, rising, falling, flat }, null, 2));
+    return;
+  }
+
+  const halfH = windowHours / 2;
+  console.log(`\n${pc.bold('warden trending')} — last ${windowHours}h (first ${halfH}h vs last ${halfH}h)\n`);
+
+  if (rising.length === 0 && falling.length === 0) {
+    console.log(pc.dim('  No trend data (not enough calls in window)'));
+    return;
+  }
+
+  if (rising.length > 0) {
+    console.log(pc.green('  Rising ↑'));
+    for (const t of rising) {
+      const bar = '▲'.repeat(Math.min(t.delta, 10));
+      console.log(`    ${pc.green(bar.padEnd(11))} ${pc.bold(t.tool.padEnd(35))} ${t.first} → ${t.second}  ${pc.green(`+${t.pct}%`)}`);
+    }
+    console.log();
+  }
+
+  if (falling.length > 0) {
+    console.log(pc.red('  Falling ↓'));
+    for (const t of falling) {
+      const bar = '▼'.repeat(Math.min(Math.abs(t.delta), 10));
+      console.log(`    ${pc.red(bar.padEnd(11))} ${pc.bold(t.tool.padEnd(35))} ${t.first} → ${t.second}  ${pc.red(`${t.pct}%`)}`);
+    }
+    console.log();
+  }
+
+  if (flat.length > 0 && rising.length === 0 && falling.length === 0) {
+    console.log(pc.dim('  Stable (no change)'));
+    for (const t of flat.slice(0, 5)) {
+      console.log(pc.dim(`    ${t.tool.padEnd(35)} ${t.total} calls`));
+    }
   }
 }
 
@@ -3576,6 +3701,10 @@ async function main(): Promise<void> {
 
     case 'compare':
       await cmdCompare(argv.slice(1));
+      break;
+
+    case 'trending':
+      await cmdTrending(argv.slice(1));
       break;
 
     default:
