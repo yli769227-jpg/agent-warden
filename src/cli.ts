@@ -2783,6 +2783,130 @@ async function cmdVerifyIntegrity(flags: string[]): Promise<void> {
   if (strictExit) process.exit(1);
 }
 
+// ─── Command: chain ───────────────────────────────────────────────────────────
+
+async function cmdChain(flags: string[]): Promise<void> {
+  // Finds the most common N-step tool call chains (sequences) in the audit log.
+  // Deeper than `profile`'s top-pairs: supports chains of length 2, 3, or 4.
+  //
+  // Algorithm: sliding window of size --length over the chronologically-sorted
+  // entries. Each window produces one chain key "A → B → C".
+  //
+  // Flags:
+  //   --since/-s <expr>    Start of window (default: last 24h)
+  //   --length/-l <N>      Chain length (2-4, default: 3)
+  //   --top <N>            Top chains to show (default: 10)
+  //   --min-count <N>      Only show chains that occur >= N times (default: 2)
+  //   --json/-j            Machine-readable output
+  //   --gap-mins <G>       Max gap between chain steps in minutes (default: 30)
+  //                        A gap larger than this breaks the chain.
+
+  let sinceDate: Date | undefined;
+  let chainLen   = 3;
+  let topN       = 10;
+  let minCount   = 2;
+  let gapMins    = 30;
+  let jsonOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate = parseSince(flags[++i]!);
+    } else if ((f === '--length' || f === '-l') && flags[i + 1]) {
+      chainLen  = Math.min(4, Math.max(2, parseInt(flags[++i]!, 10) || 3));
+    } else if (f === '--top' && flags[i + 1]) {
+      topN      = parseInt(flags[++i]!, 10) || 10;
+    } else if (f === '--min-count' && flags[i + 1]) {
+      minCount  = parseInt(flags[++i]!, 10) || 2;
+    } else if (f === '--gap-mins' && flags[i + 1]) {
+      gapMins   = parseInt(flags[++i]!, 10) || 30;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  if (!sinceDate) sinceDate = new Date(Date.now() - 24 * 3_600_000);
+  const gapMs = gapMins * 60_000;
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read and sort entries ──────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  const entries: Array<{ tool: string; tsMs: number }> = [];
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+    if (!entry.ts) continue;
+    const tsMs = new Date(entry.ts).getTime();
+    if (tsMs < sinceDate.getTime()) continue;
+    entries.push({ tool: entry.tool ?? '(unknown)', tsMs });
+  }
+
+  entries.sort((a, b) => a.tsMs - b.tsMs);
+
+  // ── Build chains using sliding window ─────────────────────────────────────
+  const chainCounts = new Map<string, number>();
+
+  for (let i = 0; i <= entries.length - chainLen; i++) {
+    const window = entries.slice(i, i + chainLen);
+
+    // Check that no gap between consecutive steps exceeds gapMs
+    let valid = true;
+    for (let j = 1; j < window.length; j++) {
+      if (window[j]!.tsMs - window[j - 1]!.tsMs > gapMs) { valid = false; break; }
+    }
+    if (!valid) continue;
+
+    const key = window.map(e => e.tool).join(' → ');
+    chainCounts.set(key, (chainCounts.get(key) ?? 0) + 1);
+  }
+
+  const topChains = [...chainCounts.entries()]
+    .filter(([, count]) => count >= minCount)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topN)
+    .map(([chain, count]) => ({ chain, count }));
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:    sinceDate.toISOString(),
+      chainLen,
+      gapMins,
+      total:    entries.length,
+      chains:   topChains,
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  const maxCount = topChains.length > 0 ? topChains[0]!.count : 1;
+
+  console.log(`\n${pc.bold('warden chain')} — top ${topN} tool call sequences (length ${chainLen})`);
+  console.log(pc.dim(`  Since ${sinceDate.toISOString()} · ${entries.length} entries · gap<${gapMins}m`));
+  console.log();
+
+  if (topChains.length === 0) {
+    console.log(pc.dim(`  No chains with count >= ${minCount} found.`));
+    console.log();
+    return;
+  }
+
+  for (const { chain, count } of topChains) {
+    const bar = '█'.repeat(Math.ceil(count / maxCount * 20));
+    console.log(`  ${String(count).padStart(5)}  ${pc.dim(bar.padEnd(20))}  ${chain}`);
+  }
+  console.log();
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -6585,6 +6709,10 @@ async function main(): Promise<void> {
 
     case 'verify-integrity':
       await cmdVerifyIntegrity(argv.slice(1));
+      break;
+
+    case 'chain':
+      await cmdChain(argv.slice(1));
       break;
 
     default:
