@@ -3605,6 +3605,148 @@ async function cmdAccessPattern(flags: string[]): Promise<void> {
   console.log();
 }
 
+// ─── Command: sparkline (internal timeline variant) ───────────────────────────
+// Note: this is a new vertical block-char variant — the horizontal bucket variant
+// (`warden timeline`) already exists elsewhere in this file.
+
+async function cmdSparkline(flags: string[]): Promise<void> {
+  // Renders a compact vertical block-char sparkline of activity.
+  // Unlike the horizontal `timeline`, this puts time on X and bar-height on Y,
+  // using Unicode block characters (▁▂▃▄▅▆▇█) in a single row or multi-row grid.
+  //
+  // Flags:
+  //   --since/-s <expr>      Start of window (default: last 6h)
+  //   --window <hours>       Window width in hours (default: 6)
+  //   --buckets <N>          Number of time buckets (default: 72)
+  //   --height <H>           Max bar height in rows (default: 10)
+  //   --tool/-t <name>       Filter by tool name prefix
+  //   --json/-j              Machine-readable output (bucket list)
+
+  let sinceDate:   Date | undefined;
+  let windowHours  = 6;
+  let numBuckets   = 72;
+  let maxHeight    = 10;
+  let toolFilter   = '';
+  let jsonOutput   = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate     = parseSince(flags[++i]!);
+    } else if (f === '--window' && flags[i + 1]) {
+      windowHours   = parseFloat(flags[++i]!) || 6;
+    } else if (f === '--buckets' && flags[i + 1]) {
+      numBuckets    = Math.max(1, parseInt(flags[++i]!, 10) || 72);
+    } else if (f === '--height' && flags[i + 1]) {
+      maxHeight     = Math.max(1, parseInt(flags[++i]!, 10) || 10);
+    } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
+      toolFilter    = flags[++i]!;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput    = true;
+    }
+  }
+
+  if (!sinceDate) sinceDate = new Date(Date.now() - windowHours * 3_600_000);
+  const endDate   = new Date(sinceDate.getTime() + windowHours * 3_600_000);
+  const bucketMs  = (endDate.getTime() - sinceDate.getTime()) / numBuckets;
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read entries ──────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  const buckets = Array.from({ length: numBuckets }, () => ({ total: 0, denied: 0 }));
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+    if (!entry.ts) continue;
+
+    const tsMs = new Date(entry.ts).getTime();
+    if (tsMs < sinceDate.getTime() || tsMs >= endDate.getTime()) continue;
+
+    const tool = entry.tool ?? '';
+    if (toolFilter && !tool.startsWith(toolFilter)) continue;
+
+    const idx = Math.min(
+      numBuckets - 1,
+      Math.floor((tsMs - sinceDate.getTime()) / bucketMs),
+    );
+
+    const bucket = buckets[idx]!;
+    bucket.total++;
+    if (entry.verdict === 'deny' || entry.verdict === 'killed') bucket.denied++;
+  }
+
+  const bucketData = buckets.map((b, i) => ({
+    bucketStart: new Date(sinceDate!.getTime() + i * bucketMs).toISOString(),
+    bucketEnd:   new Date(sinceDate!.getTime() + (i + 1) * bucketMs).toISOString(),
+    total:       b.total,
+    denied:      b.denied,
+  }));
+
+  const totalCalls  = bucketData.reduce((s, b) => s + b.total, 0);
+  const maxTotal    = Math.max(1, ...bucketData.map(b => b.total));
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:      sinceDate.toISOString(),
+      end:        endDate.toISOString(),
+      windowHours,
+      numBuckets,
+      totalCalls,
+      buckets:    bucketData,
+    }, null, 2));
+    return;
+  }
+
+  // ── ASCII render ──────────────────────────────────────────────────────────
+  const BLOCK_CHARS = ' ▁▂▃▄▅▆▇█';
+
+  // For each bucket, compute 0-based height (in rows×8 subrows) 0..maxHeight*8
+  const heights = bucketData.map(b => Math.round(b.total / maxTotal * maxHeight * 8));
+  const isDenied = bucketData.map(b => b.denied > 0);
+
+  console.log(`\n${pc.bold('warden sparkline')} — activity over ${windowHours}h`);
+  console.log(pc.dim(`  Since ${sinceDate.toISOString()} · ${totalCalls} calls`));
+  console.log();
+
+  // Render rows top-to-bottom
+  for (let row = maxHeight - 1; row >= 0; row--) {
+    let line = '  ';
+    for (let col = 0; col < numBuckets; col++) {
+      const h = heights[col] ?? 0;
+      // How many subrows fill this row? Row 0 (bottom) = subrows 0-7, row 1 = subrows 8-15, etc.
+      const rowBase = row * 8;
+      const sub     = Math.max(0, Math.min(8, h - rowBase));
+      const char    = BLOCK_CHARS[sub]!;
+      if (isDenied[col] && sub > 0) {
+        line += pc.red(char);
+      } else {
+        line += sub > 0 ? pc.cyan(char) : ' ';
+      }
+    }
+    process.stdout.write(line + '\n');
+  }
+
+  // Axis label
+  const startLabel = sinceDate.toISOString().slice(0, 16).replace('T', ' ');
+  const endLabel   = endDate.toISOString().slice(0, 16).replace('T', ' ');
+  const axisWidth  = Math.min(numBuckets, 80);
+  const pad        = Math.max(0, Math.floor((axisWidth - startLabel.length - endLabel.length) / 2));
+  console.log(pc.dim(
+    '  ' + '─'.repeat(pad) + startLabel + '─'.repeat(pad) + endLabel,
+  ));
+  console.log();
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -7427,6 +7569,10 @@ async function main(): Promise<void> {
 
     case 'access-pattern':
       await cmdAccessPattern(argv.slice(1));
+      break;
+
+    case 'sparkline':
+      await cmdSparkline(argv.slice(1));
       break;
 
     default:
