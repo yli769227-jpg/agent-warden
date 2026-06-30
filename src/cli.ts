@@ -187,6 +187,7 @@ interface LogFilter {
   tool?: string;
   verdict?: string;
   since?: Date;
+  grep?: RegExp;   // match raw JSON line or any field value
   follow: boolean;
   json: boolean;   // emit raw JSON instead of human-readable output
   tail?: number;   // show only the last N matching entries before follow
@@ -223,6 +224,7 @@ function entryMatchesFilter(line: string, filter: LogFilter): boolean {
   }
   if (filter.verdict && entry.verdict !== filter.verdict) return false;
   if (filter.since && entry.ts && new Date(entry.ts) < filter.since) return false;
+  if (filter.grep && !filter.grep.test(line)) return false;
   return true;
 }
 
@@ -238,7 +240,7 @@ function printLogLine(line: string, filter: LogFilter): void {
 }
 
 async function cmdLog(flags: string[]): Promise<void> {
-  // Parse flags: --tool, --verdict, --since, --no-follow, --json, --tail N
+  // Parse flags: --tool, --verdict, --since, --no-follow, --json, --tail N, --grep
   const filter: LogFilter = { follow: true, json: false };
 
   for (let i = 0; i < flags.length; i++) {
@@ -256,6 +258,13 @@ async function cmdLog(flags: string[]): Promise<void> {
     } else if ((f === '--tail' || f === '-N') && flags[i + 1]) {
       const n = parseInt(flags[++i]!, 10);
       if (!isNaN(n) && n > 0) filter.tail = n;
+    } else if ((f === '--grep' || f === '-g') && flags[i + 1]) {
+      try {
+        filter.grep = new RegExp(flags[++i]!, 'i');
+      } catch {
+        console.error(pc.red(`Invalid --grep pattern: ${flags[i]}`));
+        process.exit(1);
+      }
     }
   }
 
