@@ -2658,6 +2658,131 @@ async function cmdRedactScan(flags: string[]): Promise<void> {
   if (exitOnFind) process.exit(1);
 }
 
+// ─── Command: verify-integrity ────────────────────────────────────────────────
+
+async function cmdVerifyIntegrity(flags: string[]): Promise<void> {
+  // Checks the audit log for signs of tampering or corruption:
+  //
+  //   1. Valid JSON — every line must parse successfully
+  //   2. Required fields — each entry must have `ts`, `tool`, `verdict`
+  //   3. Timestamp monotonicity — ts values must not go backwards
+  //   4. No duplicate timestamps — exact same ts twice in a row is suspicious
+  //
+  // Exits 1 if any violations are found (with --strict-exit) or reports them
+  // and exits 0 (for informational scans).
+  //
+  // Flags:
+  //   --since/-s <expr>   Start of window (default: all)
+  //   --json/-j           Machine-readable output
+  //   --strict-exit       Exit 1 if any violations found (CI use)
+
+  let sinceDate: Date | undefined;
+  let jsonOutput   = false;
+  let strictExit   = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if (f === '--strict-exit') {
+      strictExit = true;
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Scan ───────────────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  type Violation = { lineNo: number; type: string; detail: string };
+  const violations: Violation[] = [];
+
+  let lineNo    = 0;
+  let lastTsMs  = 0;
+  let total     = 0;
+  let skipped   = 0;
+
+  for await (const line of rl) {
+    lineNo++;
+    if (!line.trim()) continue;
+
+    // Check 1: valid JSON
+    let entry: AuditEntry;
+    try {
+      entry = JSON.parse(line) as AuditEntry;
+    } catch (e) {
+      violations.push({ lineNo, type: 'invalid-json', detail: String(e) });
+      continue;
+    }
+
+    if (sinceDate && entry.ts && new Date(entry.ts) < sinceDate) { skipped++; continue; }
+    total++;
+
+    // Check 2: required fields
+    if (!entry.ts) {
+      violations.push({ lineNo, type: 'missing-ts', detail: 'Entry has no ts field' });
+    }
+    if (!entry.tool) {
+      violations.push({ lineNo, type: 'missing-tool', detail: 'Entry has no tool field' });
+    }
+    if (!entry.verdict) {
+      violations.push({ lineNo, type: 'missing-verdict', detail: 'Entry has no verdict field' });
+    }
+
+    // Check 3 + 4: timestamp monotonicity and duplicates
+    if (entry.ts) {
+      let tsMs: number;
+      try { tsMs = new Date(entry.ts).getTime(); } catch { tsMs = NaN; }
+
+      if (isNaN(tsMs)) {
+        violations.push({ lineNo, type: 'invalid-ts', detail: `Cannot parse ts: ${entry.ts}` });
+      } else if (lastTsMs > 0 && tsMs < lastTsMs) {
+        violations.push({ lineNo, type: 'ts-regression', detail: `Timestamp goes backward: ${entry.ts}` });
+      } else if (lastTsMs > 0 && tsMs === lastTsMs) {
+        violations.push({ lineNo, type: 'ts-duplicate', detail: `Duplicate timestamp: ${entry.ts}` });
+      }
+      if (!isNaN(tsMs)) lastTsMs = tsMs;
+    }
+  }
+
+  const passed = violations.length === 0;
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({ logFile, total, skipped, passed, violations }, null, 2));
+    if (strictExit && !passed) process.exit(1);
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  console.log(`\n${pc.bold('warden verify-integrity')} — audit log integrity check`);
+  console.log(pc.dim(`  Log: ${logFile} · ${total} entries checked`));
+  console.log();
+
+  if (passed) {
+    console.log(`${pc.green('✓')} Log integrity OK — no violations found.`);
+    console.log();
+    return;
+  }
+
+  console.log(pc.red(`✗ ${violations.length} violation(s) found:`));
+  console.log();
+  for (const v of violations) {
+    console.log(`  Line ${v.lineNo}  ${pc.bold(pc.red(v.type))}`);
+    console.log(`    ${v.detail}`);
+    console.log();
+  }
+
+  if (strictExit) process.exit(1);
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -6456,6 +6581,10 @@ async function main(): Promise<void> {
 
     case 'redact-scan':
       await cmdRedactScan(argv.slice(1));
+      break;
+
+    case 'verify-integrity':
+      await cmdVerifyIntegrity(argv.slice(1));
       break;
 
     default:
