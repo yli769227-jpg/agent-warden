@@ -69,6 +69,7 @@ function printUsage(): void {
       `  ${pc.cyan('export [config]')}   Export audit log to CSV (--output, --since, --tool, --verdict)`,
       `  ${pc.cyan('bench')}             Measure per-call policy+scrubber overhead (--iterations N, --json)`,
       `  ${pc.cyan('rotate')}            Manually rotate the audit log (--no-compress, --list)`,
+      `  ${pc.cyan('diff')}              Compare before/after stats around a split point (--split, --window, --json)`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -922,6 +923,156 @@ async function cmdRotate(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: diff ────────────────────────────────────────────────────────────
+
+interface PeriodStats {
+  total: number;
+  byVerdict: Record<string, number>;
+  byTool: Record<string, number>;
+}
+
+async function readPeriodStats(logFile: string, from: Date, to: Date): Promise<PeriodStats> {
+  const stats: PeriodStats = { total: 0, byVerdict: {}, byTool: {} };
+
+  if (!fs.existsSync(logFile)) return stats;
+
+  const readStream = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl         = readline.createInterface({ input: readStream, crlfDelay: Infinity });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    const ts = entry.ts ? new Date(entry.ts) : null;
+    if (!ts || ts < from || ts > to) continue;
+
+    stats.total++;
+    stats.byVerdict[entry.verdict] = (stats.byVerdict[entry.verdict] ?? 0) + 1;
+    stats.byTool[entry.tool]       = (stats.byTool[entry.tool] ?? 0) + 1;
+  }
+
+  return stats;
+}
+
+async function cmdDiff(flags: string[]): Promise<void> {
+  // Compare [--before T] window vs [--after T] window.
+  // Default: split the last 24h in half (first 12h vs last 12h).
+  // --before <timestamp-or-expr>: end of the "before" period
+  // --after  <timestamp-or-expr>: start of the "after" period
+  // --window <expr>: half-window length (default "12h")
+  // --json: machine-readable output
+
+  let splitPoint = new Date(Date.now() - 12 * 3_600_000); // 12h ago
+  let windowMs   = 12 * 3_600_000;
+  let jsonOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if ((f === '--split' || f === '-s') && flags[i + 1]) {
+      splitPoint = parseSince(flags[++i]!);
+    } else if ((f === '--window' || f === '-w') && flags[i + 1]) {
+      const windowDate = parseSince(flags[++i]!);
+      windowMs = Date.now() - windowDate.getTime();
+    }
+  }
+
+  const beforeFrom = new Date(splitPoint.getTime() - windowMs);
+  const beforeTo   = splitPoint;
+  const afterFrom  = splitPoint;
+  const afterTo    = new Date(splitPoint.getTime() + windowMs);
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  const [before, after] = await Promise.all([
+    readPeriodStats(logFile, beforeFrom, beforeTo),
+    readPeriodStats(logFile, afterFrom, afterTo),
+  ]);
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      split:  splitPoint.toISOString(),
+      window: `${Math.round(windowMs / 3_600_000)}h`,
+      before: { from: beforeFrom.toISOString(), to: beforeTo.toISOString(), ...before },
+      after:  { from: afterFrom.toISOString(),  to: afterTo.toISOString(),  ...after  },
+    }, null, 2));
+    return;
+  }
+
+  const fmtPct  = (n: number, total: number): string =>
+    total === 0 ? '—' : `${((n / total) * 100).toFixed(1)}%`;
+
+  const fmtDiff = (a: number, b: number): string => {
+    const d = b - a;
+    if (d === 0) return pc.dim('±0');
+    return d > 0 ? pc.red(`+${d}`) : pc.green(`${d}`);
+  };
+
+  const fmtPctDiff = (a: number, ta: number, b: number, tb: number): string => {
+    const pa = ta === 0 ? 0 : (a / ta) * 100;
+    const pb = tb === 0 ? 0 : (b / tb) * 100;
+    const d  = pb - pa;
+    if (Math.abs(d) < 0.05) return pc.dim('±0%');
+    const s = d.toFixed(1) + '%';
+    return d > 0 ? pc.red(`+${s}`) : pc.green(`${s}`);
+  };
+
+  console.log(`\n${pc.bold('Warden diff')}  split: ${pc.cyan(splitPoint.toISOString())}\n`);
+  console.log(
+    `  ${pc.dim('Period')}          ${pc.bold('Before'.padEnd(12))}  ${pc.bold('After'.padEnd(12))}  ${pc.bold('Δ')}`,
+  );
+  console.log(`  ${pc.dim('─'.repeat(50))}`);
+  console.log(
+    `  ${'Total calls'.padEnd(16)}  ${String(before.total).padEnd(12)}  ${String(after.total).padEnd(12)}  ${fmtDiff(before.total, after.total)}`,
+  );
+
+  const verdictOrder = ['allow', 'deny', 'killed'];
+  const verdictSet = new Set([...Object.keys(before.byVerdict), ...Object.keys(after.byVerdict)]);
+  const verdicts = [
+    ...verdictOrder.filter((v) => verdictSet.has(v)),
+    ...Array.from(verdictSet).filter((v) => !verdictOrder.includes(v)).sort(),
+  ];
+  for (const v of verdicts) {
+    const b = before.byVerdict[v] ?? 0;
+    const a = after.byVerdict[v]  ?? 0;
+    const label =
+      v === 'allow'  ? pc.green('allow') :
+      v === 'deny'   ? pc.red('deny') :
+      v === 'killed' ? pc.bgRed(pc.white('killed')) :
+                       pc.yellow(v);
+
+    console.log(
+      `  ${(label + '  rate').padEnd(24)}  ` +
+      `${fmtPct(b, before.total).padEnd(12)}  ` +
+      `${fmtPct(a, after.total).padEnd(12)}  ` +
+      `${fmtPctDiff(b, before.total, a, after.total)}`,
+    );
+  }
+
+  // Top tools that changed
+  const allTools = new Set([...Object.keys(before.byTool), ...Object.keys(after.byTool)]);
+  const toolDeltas = Array.from(allTools).map((t) => ({
+    t,
+    delta: (after.byTool[t] ?? 0) - (before.byTool[t] ?? 0),
+  })).sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta)).slice(0, 5);
+
+  if (toolDeltas.some(({ delta }) => delta !== 0)) {
+    console.log(`\n${pc.bold('Top tool changes:')}`);
+    for (const { t, delta } of toolDeltas) {
+      if (delta === 0) continue;
+      const b = before.byTool[t] ?? 0;
+      const a = after.byTool[t]  ?? 0;
+      console.log(
+        `  ${pc.cyan(t.padEnd(36))}  ${String(b).padEnd(6)} → ${String(a).padEnd(6)}  ${fmtDiff(b, a)}`,
+      );
+    }
+  }
+
+  console.log();
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
 
@@ -980,6 +1131,10 @@ async function main(): Promise<void> {
 
     case 'rotate':
       await cmdRotate(argv.slice(1));
+      break;
+
+    case 'diff':
+      await cmdDiff(argv.slice(1));
       break;
 
     default:
