@@ -69,6 +69,37 @@ function expandTilde(filePath: string): string {
   return filePath;
 }
 
+/**
+ * Expands `${VAR}` and `$VAR` references in a string using `process.env`.
+ * Unrecognised variable names are left as-is (not replaced with empty string).
+ */
+function expandEnvVars(value: string): string {
+  // ${VAR} form
+  let result = value.replace(/\$\{([^}]+)\}/g, (_match, name: string) => {
+    return process.env[name] ?? _match;
+  });
+  // $VAR form (word boundary — must come after ${} to avoid double-expanding)
+  result = result.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name: string) => {
+    return process.env[name] ?? _match;
+  });
+  return result;
+}
+
+/**
+ * Recursively expands `${VAR}` / `$VAR` in string leaves of a plain-object tree.
+ * Mutates strings inside the object but does not replace top-level non-objects.
+ */
+function expandEnvVarsInObject(obj: Record<string, unknown>): void {
+  for (const key of Object.keys(obj)) {
+    const val = obj[key];
+    if (typeof val === 'string') {
+      obj[key] = expandEnvVars(val);
+    } else if (isPlainObject(val)) {
+      expandEnvVarsInObject(val as Record<string, unknown>);
+    }
+  }
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -169,6 +200,24 @@ export function loadConfig(configPath?: string): WardenConfig {
   // ── Expand ~ in logFile ────────────────────────────────────────────────────
   if (merged.logFile) {
     merged.logFile = expandTilde(merged.logFile);
+  }
+
+  // ── Expand ${VAR} in server env values ────────────────────────────────────
+  // Example: GITHUB_TOKEN: "${GITHUB_TOKEN}" → resolved from process.env
+  if (merged.servers) {
+    for (const serverCfg of Object.values(merged.servers)) {
+      if (serverCfg.env) {
+        expandEnvVarsInObject(serverCfg.env as unknown as Record<string, unknown>);
+      }
+    }
+  }
+
+  // ── Expand ${VAR} in webhook target URLs / secrets ────────────────────────
+  if (merged.webhook?.targets) {
+    for (const target of merged.webhook.targets) {
+      const t = target as Record<string, unknown>;
+      expandEnvVarsInObject(t);
+    }
   }
 
   // ── Debug log ──────────────────────────────────────────────────────────────

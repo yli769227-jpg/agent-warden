@@ -130,6 +130,75 @@ logFile: ~/some/path/audit.jsonl
     expect(() => loadConfig(nonExistent)).toThrow(/\[warden:config\]/);
     expect(() => loadConfig(nonExistent)).toThrow(nonExistent);
   });
+
+  test('8. ${VAR} in server env is expanded from process.env', () => {
+    process.env['TEST_WARDEN_TOKEN'] = 'secret-abc-123';
+    const file = writeTmpYaml(
+      tmpDir,
+      `
+servers:
+  github:
+    command: node
+    args: [server.js]
+    env:
+      GITHUB_TOKEN: "\${TEST_WARDEN_TOKEN}"
+      EXTRA_VAR: "prefix-\${TEST_WARDEN_TOKEN}-suffix"
+`,
+    );
+
+    const config = loadConfig(file);
+    const ghEnv = config.servers?.['github']?.env ?? {};
+    expect(ghEnv['GITHUB_TOKEN']).toBe('secret-abc-123');
+    expect(ghEnv['EXTRA_VAR']).toBe('prefix-secret-abc-123-suffix');
+
+    delete process.env['TEST_WARDEN_TOKEN'];
+  });
+
+  test('9. ${VAR} with unknown variable name left as-is', () => {
+    const randomVar = `TEST_WARDEN_NONEXISTENT_${Date.now()}`;
+    const file = writeTmpYaml(
+      tmpDir,
+      `
+servers:
+  myserver:
+    command: node
+    args: [server.js]
+    env:
+      SOME_KEY: "\${${randomVar}}"
+`,
+    );
+
+    const config = loadConfig(file);
+    const env = config.servers?.['myserver']?.env ?? {};
+    expect(env['SOME_KEY']).toBe(`\${${randomVar}}`);
+  });
+
+  test('10. ${VAR} in webhook target URL and secret are expanded', () => {
+    process.env['TEST_WARDEN_WEBHOOK_URL']    = 'https://hooks.example.com/webhook';
+    process.env['TEST_WARDEN_WEBHOOK_SECRET'] = 'supersecret';
+    const file = writeTmpYaml(
+      tmpDir,
+      `
+servers:
+  fs:
+    command: node
+    args: [s.js]
+webhook:
+  enabled: true
+  targets:
+    - url: "\${TEST_WARDEN_WEBHOOK_URL}"
+      secret: "\${TEST_WARDEN_WEBHOOK_SECRET}"
+`,
+    );
+
+    const config = loadConfig(file);
+    const target = config.webhook?.targets?.[0] as { url: string; secret: string } | undefined;
+    expect(target?.url).toBe('https://hooks.example.com/webhook');
+    expect(target?.secret).toBe('supersecret');
+
+    delete process.env['TEST_WARDEN_WEBHOOK_URL'];
+    delete process.env['TEST_WARDEN_WEBHOOK_SECRET'];
+  });
 });
 
 // ─── resolveConfigPath ────────────────────────────────────────────────────────
