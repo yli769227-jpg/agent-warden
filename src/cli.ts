@@ -2255,6 +2255,151 @@ async function cmdLatencyPercentiles(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: policy-stats ────────────────────────────────────────────────────
+
+async function cmdPolicyStats(flags: string[]): Promise<void> {
+  // Analyses the audit log and reports which policy rules fired most often.
+  //
+  // Reasons recorded in audit entries (via the `reason` field) represent the
+  // policy rule that matched. This command aggregates those reason strings,
+  // shows how often each fired (allow vs deny), and flags any reasons that
+  // appear in the config but never showed up in the log (potentially dead rules).
+  //
+  // Also reports: uncaught calls (no reason recorded = default action applied).
+  //
+  // Flags:
+  //   --since/-s <expr>    Start of window (default: last 24h)
+  //   --config/-c <path>   Load config to cross-reference policy rules
+  //   --json/-j            Machine-readable output
+  //   --min-hits <N>       Only show rules with >= N hits (default: 1)
+
+  let sinceDate: Date | undefined;
+  let configPath: string | undefined;
+  let jsonOutput = false;
+  let minHits    = 1;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if ((f === '--config' || f === '-c') && flags[i + 1]) {
+      configPath = flags[++i];
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if (f === '--min-hits' && flags[i + 1]) {
+      minHits    = parseInt(flags[++i]!, 10) || 1;
+    }
+  }
+
+  if (!sinceDate) sinceDate = new Date(Date.now() - 24 * 3_600_000);
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read log ────────────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  type RuleStat = { reason: string; hits: number; allowed: number; denied: number; killed: number };
+  const byReason = new Map<string, RuleStat>();
+  let   total         = 0;
+  let   uncaught      = 0;
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    total++;
+    const reason = (entry.reason ?? '').trim();
+
+    if (!reason) { uncaught++; continue; }
+
+    if (!byReason.has(reason)) {
+      byReason.set(reason, { reason, hits: 0, allowed: 0, denied: 0, killed: 0 });
+    }
+    const s = byReason.get(reason)!;
+    s.hits++;
+    if (entry.verdict === 'allow')        s.allowed++;
+    else if (entry.verdict === 'deny')    s.denied++;
+    else if (entry.verdict === 'killed')  s.killed++;
+  }
+
+  // ── Load config policy rules for cross-referencing ─────────────────────────
+  let configRules: string[] = [];
+  if (configPath) {
+    try {
+      const cfg   = await loadConfig(configPath);
+      const rules = (cfg as unknown as Record<string, unknown>)['policy'] as { rules?: Array<{ reason?: string }> } | undefined;
+      configRules = (rules?.rules ?? [])
+        .map(r => r.reason ?? '')
+        .filter(r => r.length > 0);
+    } catch { /* ignore config load errors */ }
+  }
+
+  const ruleStats = [...byReason.values()]
+    .filter(r => r.hits >= minHits)
+    .sort((a, b) => b.hits - a.hits);
+
+  const deadRules = configRules.filter(r => !byReason.has(r));
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:      sinceDate.toISOString(),
+      total,
+      uncaught,
+      uncaughtPct: total > 0 ? Math.round(uncaught / total * 100) : 0,
+      rules:      ruleStats,
+      deadRules,
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  console.log(`\n${pc.bold('warden policy-stats')} — rule hit analysis`);
+  console.log(pc.dim(`  Since ${sinceDate.toISOString()} · ${total} total calls`));
+  console.log();
+
+  if (total === 0) {
+    console.log(pc.dim('  No entries in this window.'));
+    console.log();
+    return;
+  }
+
+  const uncaughtPct = Math.round(uncaught / total * 100);
+  console.log(`  Default action (no rule matched):  ${uncaught} calls (${uncaughtPct}%)`);
+  console.log();
+
+  if (ruleStats.length === 0) {
+    console.log(pc.dim('  No named policy rules fired in this window.'));
+  } else {
+    console.log(`  ${pc.bold('Rules by hit count:')}`);
+    for (const r of ruleStats) {
+      const denyStr  = r.denied > 0  ? pc.red(` deny=${r.denied}`)   : '';
+      const killStr  = r.killed > 0  ? pc.red(` kill=${r.killed}`)   : '';
+      const allowStr = r.allowed > 0 ? pc.green(` allow=${r.allowed}`) : '';
+      const pct      = Math.round(r.hits / total * 100);
+      console.log(`    ${String(r.hits).padStart(5)} (${String(pct).padStart(2)}%)  ${r.reason}${allowStr}${denyStr}${killStr}`);
+    }
+  }
+
+  if (deadRules.length > 0) {
+    console.log();
+    console.log(`  ${pc.bold(pc.yellow(`Dead rules (in config but never matched, ${deadRules.length}):`))} `);
+    for (const r of deadRules) {
+      console.log(`    ${pc.dim('─')} ${r}`);
+    }
+  }
+
+  console.log();
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -6041,6 +6186,10 @@ async function main(): Promise<void> {
     case 'latency-percentiles':
     case 'latency':
       await cmdLatencyPercentiles(argv.slice(1));
+      break;
+
+    case 'policy-stats':
+      await cmdPolicyStats(argv.slice(1));
       break;
 
     default:
