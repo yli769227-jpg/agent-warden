@@ -1974,6 +1974,138 @@ async function cmdAlertHistory(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: token-estimate ──────────────────────────────────────────────────
+
+async function cmdTokenEstimate(flags: string[]): Promise<void> {
+  // Estimates the number of LLM input tokens consumed by tool call arguments
+  // (and optionally results) in a time window.
+  //
+  // Uses a simple character-based heuristic: 1 token ≈ 4 characters of text.
+  // This matches OpenAI / Anthropic rule-of-thumb and is accurate within ±15%.
+  //
+  // Useful for cost attribution:
+  //   "How many input tokens did filesystem reads consume this session?"
+  //
+  // Flags:
+  //   --since/-s <expr>    Start of window (default: last 24h)
+  //   --window/-w <h>      Window in hours (overrides --since)
+  //   --tool/-t <glob>     Filter to matching tools
+  //   --json/-j            Machine-readable output
+  //   --chars-per-token N  Override chars-per-token ratio (default: 4)
+
+  let sinceDate: Date | undefined;
+  let toolFilter: string | undefined;
+  let jsonOutput     = false;
+  let charsPerToken  = 4;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate      = parseSince(flags[++i]!);
+    } else if ((f === '--window' || f === '-w') && flags[i + 1]) {
+      sinceDate      = new Date(Date.now() - parseFloat(flags[++i]!) * 3_600_000);
+    } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
+      toolFilter     = flags[++i];
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput     = true;
+    } else if (f === '--chars-per-token' && flags[i + 1]) {
+      charsPerToken  = parseFloat(flags[++i]!) || 4;
+    }
+  }
+
+  if (!sinceDate) sinceDate = new Date(Date.now() - 24 * 3_600_000);
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read log ────────────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  let   totalCalls   = 0;
+  let   totalChars   = 0;
+  const toolChars: Record<string, { calls: number; chars: number }> = {};
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    const tool = entry.tool ?? '(unknown)';
+    if (toolFilter) {
+      const pattern = toolFilter.replace(/\*/g, '.*').replace(/\?/g, '.');
+      if (!new RegExp(`^${pattern}$`, 'i').test(tool)) continue;
+    }
+
+    // Count chars in args (and result if present)
+    const argsStr   = entry.args  != null ? JSON.stringify(entry.args)  : '';
+    const chars     = argsStr.length;
+
+    totalCalls++;
+    totalChars += chars;
+
+    if (!toolChars[tool]) toolChars[tool] = { calls: 0, chars: 0 };
+    toolChars[tool]!.calls++;
+    toolChars[tool]!.chars += chars;
+  }
+
+  const totalTokens = Math.round(totalChars / charsPerToken);
+
+  const topTools = Object.entries(toolChars)
+    .sort((a, b) => b[1].chars - a[1].chars)
+    .slice(0, 10)
+    .map(([tool, { calls, chars }]) => ({
+      tool,
+      calls,
+      chars,
+      tokens:  Math.round(chars / charsPerToken),
+      pctOfTotal: totalChars > 0 ? Math.round(chars / totalChars * 100) : 0,
+      avgTokensPerCall: calls > 0 ? Math.round(chars / charsPerToken / calls) : 0,
+    }));
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:        sinceDate.toISOString(),
+      charsPerToken,
+      totalCalls,
+      totalChars,
+      totalTokens,
+      topTools,
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  function fmtTokens(n: number): string {
+    return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M`
+         : n >= 1_000     ? `${(n / 1_000).toFixed(1)}K`
+         : String(n);
+  }
+
+  console.log(`\n${pc.bold('warden token-estimate')} — arg token usage`);
+  console.log(pc.dim(`  Since ${sinceDate.toISOString()} · ratio=1 token per ${charsPerToken} chars`));
+  console.log();
+  console.log(`  Total calls:  ${pc.bold(String(totalCalls))}`);
+  console.log(`  Total chars:  ${totalChars.toLocaleString()}`);
+  console.log(`  Est. tokens:  ${pc.bold(pc.cyan(fmtTokens(totalTokens)))}`);
+  console.log();
+
+  if (topTools.length > 0) {
+    console.log(`  ${pc.bold('Top tools by token consumption:')}`);
+    for (const t of topTools) {
+      const bar = '█'.repeat(Math.min(20, Math.ceil(t.pctOfTotal / 5)));
+      console.log(`    ${pc.dim(bar.padEnd(20))}  ${t.tool.padEnd(30)} ${fmtTokens(t.tokens).padStart(8)} (${t.pctOfTotal}%)`);
+    }
+    console.log();
+  }
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -5751,6 +5883,10 @@ async function main(): Promise<void> {
 
     case 'alert-history':
       await cmdAlertHistory(argv.slice(1));
+      break;
+
+    case 'token-estimate':
+      await cmdTokenEstimate(argv.slice(1));
       break;
 
     default:
