@@ -91,6 +91,7 @@ function printUsage(): void {
       `  ${pc.cyan('anomaly-score')}      Compute a 0-100 risk score from recent audit behaviour`,
       `  ${pc.cyan('replay')}             Re-evaluate audit log entries against current policy`,
       `  ${pc.cyan('ci-check')}           Run all CI safety checks and exit 1 if any fail`,
+      `  ${pc.cyan('profile')}            Show tool call distribution and session behaviour profile`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -993,6 +994,149 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: profile ─────────────────────────────────────────────────────────
+
+async function cmdProfile(flags: string[]): Promise<void> {
+  // Shows a compact behavioural profile of agent activity:
+  //   - top tools by call frequency and average latency
+  //   - tool diversity (Shannon entropy)
+  //   - common call pairs (A immediately followed by B)
+  //   - busiest hour of day
+  //
+  // Flags:
+  //   --since/-s <expr>   Only include entries since this date
+  //   --top N             Show top N tools (default 15)
+  //   --json/-j           Machine-readable output
+
+  let sinceDate:  Date | undefined;
+  let topN     = 15;
+  let jsonOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate = parseSince(flags[++i]!);
+    } else if (f === '--top' && flags[i + 1]) {
+      topN = parseInt(flags[++i]!, 10);
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Aggregate ──────────────────────────────────────────────────────────────
+  const toolStats:    Record<string, { calls: number; totalMs: number; denied: number }> = {};
+  const hourCounts:   number[] = Array.from({ length: 24 }, () => 0);
+  const callPairs:    Record<string, number> = {};
+  const allTools:     string[] = [];  // in order (for pair computation)
+  let lastTool:       string | null = null;
+  let total           = 0;
+
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (sinceDate && entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    const tool = entry.tool ?? '(unknown)';
+    total++;
+
+    if (!toolStats[tool]) toolStats[tool] = { calls: 0, totalMs: 0, denied: 0 };
+    toolStats[tool]!.calls++;
+    if (typeof entry.durationMs === 'number') toolStats[tool]!.totalMs += entry.durationMs;
+    if (entry.verdict === 'deny' || entry.verdict === 'killed') toolStats[tool]!.denied++;
+
+    if (entry.ts) {
+      const hour = new Date(entry.ts).getUTCHours();
+      hourCounts[hour]++;
+    }
+
+    if (lastTool) {
+      const pair = `${lastTool} → ${tool}`;
+      callPairs[pair] = (callPairs[pair] ?? 0) + 1;
+    }
+    lastTool = tool;
+    allTools.push(tool);
+  }
+
+  // ── Computed metrics ───────────────────────────────────────────────────────
+  const topTools = Object.entries(toolStats)
+    .map(([tool, s]) => ({
+      tool,
+      calls:   s.calls,
+      pct:     total > 0 ? parseFloat((s.calls / total * 100).toFixed(1)) : 0,
+      avgMs:   s.calls > 0 ? Math.round(s.totalMs / s.calls) : 0,
+      denied:  s.denied,
+    }))
+    .sort((a, b) => b.calls - a.calls)
+    .slice(0, topN);
+
+  // Shannon entropy (tool diversity): H = -sum(p * log2(p))
+  let entropy = 0;
+  for (const s of Object.values(toolStats)) {
+    const p = s.calls / Math.max(total, 1);
+    if (p > 0) entropy -= p * Math.log2(p);
+  }
+  entropy = parseFloat(entropy.toFixed(3));
+
+  const topPairs = Object.entries(callPairs)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([pair, count]) => ({ pair, count }));
+
+  const busiestHour = hourCounts.indexOf(Math.max(...hourCounts));
+  const uniqueTools = Object.keys(toolStats).length;
+
+  // ── Output ─────────────────────────────────────────────────────────────────
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      total,
+      uniqueTools,
+      entropy,
+      busiestHour,
+      topTools,
+      topPairs,
+    }, null, 2));
+    return;
+  }
+
+  console.log(`\n${pc.bold('warden profile')}\n`);
+  console.log(`  Total calls   : ${total}`);
+  console.log(`  Unique tools  : ${uniqueTools}`);
+  console.log(`  Entropy       : ${entropy}  ${pc.dim('(higher = more diverse)')}`);
+  console.log(`  Busiest hour  : ${String(busiestHour).padStart(2, '0')}:00 UTC`);
+  console.log();
+
+  if (topTools.length > 0) {
+    console.log(pc.bold('  Top tools:'));
+    console.log(pc.dim(`  ${'Tool'.padEnd(35)} ${'Calls'.padEnd(8)} ${'%'.padEnd(7)} ${'AvgMs'.padEnd(8)} Denied`));
+    for (const t of topTools) {
+      const bar  = '█'.repeat(Math.min(Math.round(t.pct / 5), 20));
+      const dStr = t.denied > 0 ? pc.red(String(t.denied)) : pc.dim('0');
+      console.log(`  ${t.tool.padEnd(35)} ${String(t.calls).padEnd(8)} ${String(t.pct).padEnd(7)} ${String(t.avgMs + 'ms').padEnd(8)} ${dStr}  ${pc.dim(bar)}`);
+    }
+    console.log();
+  }
+
+  if (topPairs.length > 0) {
+    console.log(pc.bold('  Common call pairs:'));
+    for (const p of topPairs) {
+      console.log(`  ${pc.dim('×' + p.count)} ${p.pair}`);
+    }
+    console.log();
   }
 }
 
@@ -4250,6 +4394,10 @@ async function main(): Promise<void> {
 
     case 'ci-check':
       await cmdCiCheck(argv.slice(1));
+      break;
+
+    case 'profile':
+      await cmdProfile(argv.slice(1));
       break;
 
     default:
