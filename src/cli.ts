@@ -85,6 +85,7 @@ function printUsage(): void {
       `  ${pc.cyan('timeline')}           ASCII timeline of tool calls grouped by time bucket`,
       `  ${pc.cyan('doctor')}             Full health check of warden installation and config`,
       `  ${pc.cyan('suggest')}            Analyse audit log and suggest policy rules`,
+      `  ${pc.cyan('snapshot')}           Save a timestamped JSON snapshot of current audit stats`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -987,6 +988,128 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: snapshot ────────────────────────────────────────────────────────
+
+async function cmdSnapshot(flags: string[]): Promise<void> {
+  // Save a timestamped snapshot of the current audit stats to a JSON file.
+  // Useful in CI/CD to persist metrics across runs and compare later.
+  //
+  // Flags:
+  //   --output/-o <file>    Where to save the snapshot (default: warden-snapshot-<ts>.json)
+  //   --since/-s <expr>     Only count entries since this point
+  //   --tag <label>         Optional label to embed in the snapshot (e.g., PR number, branch)
+  //   --print               Also print the snapshot to stdout after saving
+
+  let outputPath: string | undefined;
+  let sinceDate:  Date | undefined;
+  let tag:        string | undefined;
+  let printOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--output' || f === '-o') && flags[i + 1]) {
+      outputPath = flags[++i];
+    } else if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate = parseSince(flags[++i]!);
+    } else if (f === '--tag' && flags[i + 1]) {
+      tag = flags[++i];
+    } else if (f === '--print' || f === '-p') {
+      printOutput = true;
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  // ── Aggregate stats ────────────────────────────────────────────────────────
+  const byVerdict: Record<string, number> = {};
+  const byTool:    Record<string, { allow: number; deny: number; killed: number }> = {};
+  let total     = 0;
+  let firstTs:  string | undefined;
+  let lastTs:   string | undefined;
+  const durations: number[] = [];
+
+  if (fs.existsSync(logFile)) {
+    const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      let entry: AuditEntry;
+      try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+      if (sinceDate && entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+      total++;
+      byVerdict[entry.verdict] = (byVerdict[entry.verdict] ?? 0) + 1;
+
+      const t = entry.tool ?? '(unknown)';
+      if (!byTool[t]) byTool[t] = { allow: 0, deny: 0, killed: 0 };
+      if (entry.verdict === 'allow')  byTool[t]!.allow++;
+      if (entry.verdict === 'deny')   byTool[t]!.deny++;
+      if (entry.verdict === 'killed') byTool[t]!.killed++;
+
+      if (!firstTs || (entry.ts && entry.ts < firstTs)) firstTs = entry.ts;
+      if (!lastTs  || (entry.ts && entry.ts > lastTs))  lastTs   = entry.ts;
+      if (typeof entry.durationMs === 'number') durations.push(entry.durationMs);
+    }
+  }
+
+  const avgDurationMs = durations.length > 0
+    ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length)
+    : null;
+
+  const p95DurationMs = durations.length > 0
+    ? (() => { durations.sort((a, b) => a - b); return durations[Math.floor(durations.length * 0.95)] ?? null; })()
+    : null;
+
+  const topTools = Object.entries(byTool)
+    .map(([tool, s]) => ({ tool, total: s.allow + s.deny + s.killed, ...s }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 20);
+
+  const snapshot = {
+    version:      1,
+    snapshotAt:   new Date().toISOString(),
+    logFile,
+    ...(tag ? { tag } : {}),
+    ...(sinceDate ? { since: sinceDate.toISOString() } : {}),
+    period: {
+      first: firstTs ?? null,
+      last:  lastTs  ?? null,
+    },
+    totals: {
+      calls:   total,
+      allow:   byVerdict['allow']  ?? 0,
+      deny:    byVerdict['deny']   ?? 0,
+      killed:  byVerdict['killed'] ?? 0,
+      denyRate: total > 0
+        ? parseFloat((((byVerdict['deny'] ?? 0) + (byVerdict['killed'] ?? 0)) / total * 100).toFixed(2))
+        : 0,
+    },
+    latency: {
+      avgMs: avgDurationMs,
+      p95Ms: p95DurationMs,
+    },
+    topTools,
+  };
+
+  // ── Write snapshot ─────────────────────────────────────────────────────────
+  const snapshotJson = JSON.stringify(snapshot, null, 2);
+
+  if (!outputPath) {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    outputPath = path.join(process.cwd(), `warden-snapshot-${ts}.json`);
+  }
+
+  fs.writeFileSync(outputPath, snapshotJson + '\n', 'utf8');
+  console.log(pc.green(`✅ Snapshot saved → ${outputPath}`));
+  console.log(pc.dim(`   ${total} calls | allow: ${snapshot.totals.allow}, deny: ${snapshot.totals.deny}, killed: ${snapshot.totals.killed} | deny rate: ${snapshot.totals.denyRate}%`));
+
+  if (printOutput) {
+    console.log('\n' + snapshotJson);
   }
 }
 
@@ -3277,6 +3400,10 @@ async function main(): Promise<void> {
 
     case 'suggest':
       await cmdSuggest(argv.slice(1));
+      break;
+
+    case 'snapshot':
+      await cmdSnapshot(argv.slice(1));
       break;
 
     default:
