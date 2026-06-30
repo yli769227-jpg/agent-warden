@@ -472,60 +472,90 @@ async function cmdCheck(configArg?: string): Promise<void> {
     console.log(`${pc.red('❌')} Log directory not writable: ${logDir}`);
   }
 
-  // 3. Probe downstream command(s)
-  // Resolve to the first server command (legacy or first in servers map)
-  let cmdParts: string[];
+  // 3. Probe all downstream servers in parallel
+  interface ServerProbeTarget {
+    label: string;
+    cmdParts: string[];
+    env?: Record<string, string>;
+  }
+
+  const probeTargets: ServerProbeTarget[] = [];
+
   if (config.servers && Object.keys(config.servers).length > 0) {
-    const firstServer = Object.values(config.servers)[0]!;
-    cmdParts = [firstServer.command, ...(firstServer.args ?? [])];
+    for (const [name, srv] of Object.entries(config.servers)) {
+      probeTargets.push({
+        label: name,
+        cmdParts: [srv.command, ...(srv.args ?? [])],
+        env: srv.env as Record<string, string> | undefined,
+      });
+    }
   } else if (config.downstreamCommand && config.downstreamCommand.length > 0) {
-    cmdParts = config.downstreamCommand;
+    probeTargets.push({ label: '(legacy)', cmdParts: config.downstreamCommand });
   } else {
     console.log(`${pc.red('❌')} No downstream server configured`);
     return;
   }
-  const [executable, ...cmdArgs] = cmdParts;
-  console.log(`\nProbing downstream: ${pc.cyan(cmdParts.join(' '))}`);
 
-  const spawnResult = await new Promise<'started' | 'error' | 'exited'>((resolve) => {
-    let settled = false;
+  async function probeServer(target: ServerProbeTarget): Promise<'started' | 'error' | 'exited'> {
+    const [executable, ...cmdArgs] = target.cmdParts;
+    const mergedEnv = target.env ? { ...process.env, ...target.env } : process.env;
 
-    const child = spawn(executable, cmdArgs, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env,
+    return new Promise<'started' | 'error' | 'exited'>((resolve) => {
+      let settled = false;
+
+      const child = spawn(executable, cmdArgs, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: mergedEnv,
+      });
+
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        child.kill('SIGTERM');
+        resolve('started');
+      }, 2000);
+
+      child.on('error', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve('error');
+      });
+
+      child.on('exit', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve('exited');
+      });
     });
+  }
 
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill('SIGTERM');
-      resolve('started');
-    }, 2000);
+  console.log(`\nProbing ${probeTargets.length} downstream server${probeTargets.length !== 1 ? 's' : ''}…`);
 
-    child.on('error', (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      console.log(`${pc.red('❌')} Downstream spawn error: ${err.message}`);
-      resolve('error');
-    });
+  let anyFailed = false;
+  const probeResults = await Promise.all(probeTargets.map((t) => probeServer(t)));
 
-    child.on('exit', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
+  for (let i = 0; i < probeTargets.length; i++) {
+    const target = probeTargets[i]!;
+    const result = probeResults[i]!;
+    const cmdStr = target.cmdParts.join(' ');
+
+    if (result === 'started') {
+      console.log(`  ${pc.green('✅')} ${pc.cyan(target.label.padEnd(16))} ${pc.dim(cmdStr)}`);
+    } else if (result === 'exited') {
       console.log(
-        `${pc.yellow('⚠️')}  Downstream exited quickly (code ${code ?? '?'}) — ` +
-          'may need stdin / MCP handshake to stay alive',
+        `  ${pc.yellow('⚠️')}  ${pc.cyan(target.label.padEnd(16))} exited quickly — ` +
+          `may need MCP handshake to stay alive  ${pc.dim(cmdStr)}`,
       );
-      resolve('exited');
-    });
-  });
+    } else {
+      console.log(`  ${pc.red('❌')} ${pc.cyan(target.label.padEnd(16))} spawn error  ${pc.dim(cmdStr)}`);
+      anyFailed = true;
+    }
+  }
 
-  if (spawnResult === 'started') {
-    console.log(
-      `${pc.green('✅')} Downstream process started (killed after 2 s probe timeout)`,
-    );
+  if (anyFailed) {
+    console.log(pc.yellow('\n⚠️  One or more servers could not be started.'));
   }
 
   // 4. Print config summary
