@@ -3251,6 +3251,193 @@ async function cmdToolGraph(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: cost-estimate ───────────────────────────────────────────────────
+
+// Pricing table: USD per 1M tokens (input/output).
+// These are approximate and based on public API pricing; adjust as needed.
+const MODEL_PRICING: Record<string, { input: number; output: number; label: string }> = {
+  'claude-opus-4':     { input: 15.00, output: 75.00, label: 'Claude Opus 4' },
+  'claude-sonnet-4':   { input:  3.00, output: 15.00, label: 'Claude Sonnet 4' },
+  'claude-haiku-4':    { input:  0.80, output:  4.00, label: 'Claude Haiku 4' },
+  'gpt-4o':            { input:  2.50, output: 10.00, label: 'GPT-4o' },
+  'gpt-4o-mini':       { input:  0.15, output:  0.60, label: 'GPT-4o Mini' },
+  'gpt-4-turbo':       { input: 10.00, output: 30.00, label: 'GPT-4 Turbo' },
+};
+const DEFAULT_MODEL_KEY = 'claude-sonnet-4';
+
+async function cmdCostEstimate(flags: string[]): Promise<void> {
+  // Estimates the dollar cost of tool call args tokens sent to an LLM.
+  //
+  // Uses the same char→token heuristic as `warden token-estimate` (4 chars/token).
+  // The tool args are input tokens; output tokens are estimated as a multiple of input
+  // (default: 0.3× — tools are typically short in/short out).
+  //
+  // This is an ORDER-OF-MAGNITUDE estimate only. Real costs depend on:
+  //   - System prompt length, conversation context, model's internal overhead
+  //   - Actual tokenizer (varies by model)
+  //   - Whether caching is enabled
+  //
+  // Flags:
+  //   --since/-s <expr>         Start of window (default: last 24h)
+  //   --model/-m <key>          Model pricing tier (default: claude-sonnet-4)
+  //   --output-ratio <R>        Output/input token ratio (default: 0.3)
+  //   --chars-per-token <N>     Characters per token (default: 4)
+  //   --list-models             List available model pricing tiers
+  //   --json/-j                 Machine-readable output
+
+  let sinceDate: Date | undefined;
+  let modelKey        = DEFAULT_MODEL_KEY;
+  let outputRatio     = 0.3;
+  let charsPerToken   = 4;
+  let jsonOutput      = false;
+  let listModels      = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate       = parseSince(flags[++i]!);
+    } else if ((f === '--model' || f === '-m') && flags[i + 1]) {
+      modelKey        = flags[++i]!;
+    } else if (f === '--output-ratio' && flags[i + 1]) {
+      outputRatio     = parseFloat(flags[++i]!) || 0.3;
+    } else if (f === '--chars-per-token' && flags[i + 1]) {
+      charsPerToken   = parseInt(flags[++i]!, 10) || 4;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput      = true;
+    } else if (f === '--list-models') {
+      listModels      = true;
+    }
+  }
+
+  if (listModels) {
+    const rows = Object.entries(MODEL_PRICING).map(([key, p]) => ({
+      key,
+      label:  p.label,
+      input:  `$${p.input}/1M`,
+      output: `$${p.output}/1M`,
+    }));
+    if (jsonOutput) { console.log(JSON.stringify(rows, null, 2)); return; }
+    console.log('\n  Available model pricing tiers:\n');
+    for (const r of rows) {
+      console.log(`  ${r.key.padEnd(20)} ${r.label.padEnd(20)} in: ${r.input.padEnd(12)} out: ${r.output}`);
+    }
+    console.log();
+    return;
+  }
+
+  if (!sinceDate) sinceDate = new Date(Date.now() - 24 * 3_600_000);
+
+  const pricing = MODEL_PRICING[modelKey] ?? MODEL_PRICING[DEFAULT_MODEL_KEY]!;
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read and tally ────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  let totalCalls   = 0;
+  let totalChars   = 0;
+
+  const toolMap = new Map<string, { calls: number; chars: number }>();
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+    if (!entry.ts || new Date(entry.ts) < sinceDate) continue;
+
+    const tool  = entry.tool ?? '(unknown)';
+    const chars = entry.args != null ? JSON.stringify(entry.args).length : 0;
+
+    totalCalls++;
+    totalChars += chars;
+
+    if (!toolMap.has(tool)) toolMap.set(tool, { calls: 0, chars: 0 });
+    const ts = toolMap.get(tool)!;
+    ts.calls++;
+    ts.chars += chars;
+  }
+
+  // ── Compute costs ─────────────────────────────────────────────────────────
+  function toCost(chars: number): { inputTokens: number; outputTokens: number; inputUsd: number; outputUsd: number; totalUsd: number } {
+    const inputTokens  = Math.round(chars / charsPerToken);
+    const outputTokens = Math.round(inputTokens * outputRatio);
+    const inputUsd     = (inputTokens  / 1_000_000) * pricing.input;
+    const outputUsd    = (outputTokens / 1_000_000) * pricing.output;
+    return { inputTokens, outputTokens, inputUsd, outputUsd, totalUsd: inputUsd + outputUsd };
+  }
+
+  const total = toCost(totalChars);
+
+  const byTool = [...toolMap.entries()]
+    .map(([tool, s]) => {
+      const c = toCost(s.chars);
+      return {
+        tool,
+        calls:       s.calls,
+        chars:       s.chars,
+        inputTokens: c.inputTokens,
+        outputTokens: c.outputTokens,
+        totalUsd:    c.totalUsd,
+        pctOfTotal:  total.totalUsd > 0 ? Math.round(c.totalUsd / total.totalUsd * 100) : 0,
+      };
+    })
+    .sort((a, b) => b.totalUsd - a.totalUsd);
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:       sinceDate.toISOString(),
+      model:       modelKey,
+      modelLabel:  pricing.label,
+      charsPerToken,
+      outputRatio,
+      totalCalls,
+      totalChars,
+      inputTokens:  total.inputTokens,
+      outputTokens: total.outputTokens,
+      inputUsd:     +total.inputUsd.toFixed(6),
+      outputUsd:    +total.outputUsd.toFixed(6),
+      totalUsd:     +total.totalUsd.toFixed(6),
+      byTool,
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  function fmt(n: number): string {
+    return n < 0.01 ? `$${(n * 1000).toFixed(3)}m` : `$${n.toFixed(4)}`;
+  }
+
+  console.log(`\n${pc.bold('warden cost-estimate')} — estimated LLM cost of tool call inputs`);
+  console.log(pc.dim(`  Since ${sinceDate.toISOString()} · Model: ${pricing.label} · ${totalCalls} calls`));
+  console.log();
+  console.log(
+    `  Input tokens:  ${total.inputTokens.toLocaleString().padStart(10)}  ${fmt(total.inputUsd)}\n` +
+    `  Output tokens: ${total.outputTokens.toLocaleString().padStart(10)}  ${fmt(total.outputUsd)}\n` +
+    `  ─────────────────────────────────────────────\n` +
+    `  Total est.:    ${(total.inputTokens + total.outputTokens).toLocaleString().padStart(10)}  ${pc.bold(fmt(total.totalUsd))}`,
+  );
+  console.log();
+
+  if (byTool.length > 0) {
+    console.log(pc.bold('  Top by cost:'));
+    console.log();
+    const maxUsd = byTool[0]!.totalUsd;
+    for (const t of byTool.slice(0, 10)) {
+      const bar = '█'.repeat(maxUsd > 0 ? Math.ceil(t.totalUsd / maxUsd * 20) : 1);
+      console.log(`  ${fmt(t.totalUsd).padStart(10)}  ${pc.dim(bar.padEnd(20))}  ${t.tool}  (${t.pctOfTotal}%)`);
+    }
+    console.log();
+  }
+  console.log(pc.dim('  ⚠ Estimate only. Excludes system prompt, context, and model overhead.'));
+  console.log();
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -7065,6 +7252,10 @@ async function main(): Promise<void> {
 
     case 'tool-graph':
       await cmdToolGraph(argv.slice(1));
+      break;
+
+    case 'cost-estimate':
+      await cmdCostEstimate(argv.slice(1));
       break;
 
     default:
