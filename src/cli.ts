@@ -93,6 +93,7 @@ function printUsage(): void {
       `  ${pc.cyan('ci-check')}           Run all CI safety checks and exit 1 if any fail`,
       `  ${pc.cyan('profile')}            Show tool call distribution and session behaviour profile`,
       `  ${pc.cyan('summary')}            Generate a plain-English security summary for stakeholders`,
+      `  ${pc.cyan('heat-map')}           Show tool-call density as an hour × day heat map`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -996,6 +997,136 @@ async function cmdRotate(flags: string[]): Promise<void> {
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
   }
+}
+
+// ─── Command: heat-map ────────────────────────────────────────────────────────
+
+async function cmdHeatMap(flags: string[]): Promise<void> {
+  // Shows a heat map of tool calls per UTC hour across weekdays.
+  // Cells use block characters (░▒▓█) to encode density.
+  // Useful for spotting anomalous time patterns (2am file deletes, etc.)
+  //
+  // Flags:
+  //   --since/-s <expr>   Only include entries since this date
+  //   --tool/-t <glob>    Filter to matching tool names
+  //   --json/-j           Machine-readable output (hourly totals per weekday)
+  //   --verdict           Colour cells red for deny/killed vs green for allow
+
+  let sinceDate: Date | undefined;
+  let toolFilter: string | undefined;
+  let jsonOutput  = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
+      toolFilter = flags[++i];
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // Grid: [weekday 0-6][hour 0-23] = { calls, denied }
+  // weekday: 0=Sun, 1=Mon, ..., 6=Sat
+  const grid: Array<Array<{ calls: number; denied: number }>> = Array.from(
+    { length: 7 },
+    () => Array.from({ length: 24 }, () => ({ calls: 0, denied: 0 })),
+  );
+
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  let total = 0;
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (sinceDate && entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    const tool = entry.tool ?? '(unknown)';
+    if (toolFilter) {
+      const pattern = toolFilter.replace(/\*/g, '.*').replace(/\?/g, '.');
+      if (!new RegExp(`^${pattern}$`, 'i').test(tool)) continue;
+    }
+
+    if (!entry.ts) continue;
+    const d       = new Date(entry.ts);
+    const weekday = d.getUTCDay();   // 0=Sun
+    const hour    = d.getUTCHours(); // 0-23
+
+    grid[weekday]![hour]!.calls++;
+    if (entry.verdict === 'deny' || entry.verdict === 'killed') {
+      grid[weekday]![hour]!.denied++;
+    }
+    total++;
+  }
+
+  if (jsonOutput) {
+    const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    console.log(JSON.stringify({
+      total,
+      rows: grid.map((row, d) => ({
+        day:   DAYS[d]!,
+        hours: row.map((cell, h) => ({ hour: h, calls: cell.calls, denied: cell.denied })),
+      })),
+    }, null, 2));
+    return;
+  }
+
+  // ── ASCII heat map ─────────────────────────────────────────────────────────
+  // Find max for normalisation
+  const maxCalls = Math.max(1, ...grid.flatMap(row => row.map(c => c.calls)));
+
+  const BLOCKS = [' ', '░', '▒', '▓', '█'];
+
+  function cellChar(c: { calls: number; denied: number }): string {
+    if (c.calls === 0) return pc.dim(' ');
+    const idx  = Math.ceil((c.calls / maxCalls) * (BLOCKS.length - 1));
+    const ch   = BLOCKS[Math.min(idx, BLOCKS.length - 1)]!;
+    const frac = c.denied / c.calls;
+    return frac >= 0.5
+      ? pc.red(ch)
+      : frac > 0
+        ? pc.yellow(ch)
+        : pc.green(ch);
+  }
+
+  const DAYS  = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const HOURS = Array.from({ length: 24 }, (_, h) => String(h).padStart(2, '0'));
+
+  console.log(`\n${pc.bold('warden heat-map')} — ${total} calls`);
+  console.log(pc.dim('  (green=allow, yellow=mixed, red=deny/killed)'));
+  console.log();
+
+  // Hour labels
+  const hourLabel = '    ' + HOURS.map((h, i) => (i % 3 === 0 ? h : ' ')).join(' ');
+  console.log(pc.dim(hourLabel));
+
+  for (let d = 0; d < 7; d++) {
+    const row = grid[d]!;
+    const cells = row.map(c => cellChar(c)).join(' ');
+    console.log(`  ${pc.bold(DAYS[d]!.padEnd(3))} ${cells}`);
+  }
+
+  console.log();
+  const busiest = grid.flatMap((row, d) =>
+    row.map((c, h) => ({ d, h, calls: c.calls })),
+  ).sort((a, b) => b.calls - a.calls)[0];
+
+  if (busiest && busiest.calls > 0) {
+    console.log(pc.dim(`  Busiest slot: ${DAYS[busiest.d]!} ${String(busiest.h).padStart(2, '0')}:00 UTC (${busiest.calls} calls)`));
+  }
+  console.log();
 }
 
 // ─── Command: summary ─────────────────────────────────────────────────────────
@@ -4620,6 +4751,11 @@ async function main(): Promise<void> {
 
     case 'summary':
       await cmdSummary(argv.slice(1));
+      break;
+
+    case 'heat-map':
+    case 'heatmap':
+      await cmdHeatMap(argv.slice(1));
       break;
 
     default:
