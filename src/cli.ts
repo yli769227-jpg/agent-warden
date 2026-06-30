@@ -72,6 +72,7 @@ function printUsage(): void {
       `  ${pc.cyan('diff')}              Compare before/after stats around a split point (--split, --window, --json)`,
       `  ${pc.cyan('top')}               Live top-N tools by call count, refreshed every N seconds`,
       `  ${pc.cyan('policy-check')}      Dry-run a tool call through the policy engine without proxying`,
+      `  ${pc.cyan('scrub-test')}        Show which fields in a JSON payload would be redacted`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -925,6 +926,119 @@ async function cmdRotate(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: scrub-test ──────────────────────────────────────────────────────
+
+async function cmdScrubTest(flags: string[]): Promise<void> {
+  // Usage: warden scrub-test [--input '{"key":"val"}'] [--stdin] [--json] [--config path]
+  // Shows what the scrubber would redact in a given payload.
+
+  let inputJson: string | undefined;
+  let useStdin  = false;
+  let jsonOutput = false;
+  let configArg: string | undefined;
+  let customPatterns: string[] = [];
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === '--stdin' || f === '-') {
+      useStdin = true;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if ((f === '--input' || f === '-i') && flags[i + 1]) {
+      inputJson = flags[++i];
+    } else if ((f === '--config' || f === '-c') && flags[i + 1]) {
+      configArg = flags[++i];
+    } else if ((f === '--pattern' || f === '-p') && flags[i + 1]) {
+      customPatterns.push(flags[++i]!);
+    } else if (!f.startsWith('-') && inputJson == null) {
+      inputJson = f;
+    }
+  }
+
+  // Read from stdin if requested or if no input provided and not a tty
+  if (useStdin || (inputJson == null && !process.stdin.isTTY)) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin as unknown as AsyncIterable<Buffer>) {
+      chunks.push(chunk);
+    }
+    inputJson = Buffer.concat(chunks).toString('utf8').trim();
+  }
+
+  if (!inputJson) {
+    console.error(pc.red('Provide JSON via --input \'{"key":"val"}\' or pipe to stdin'));
+    console.error(pc.dim('  Example: echo \'{"token":"ghp_abc123"}\' | warden scrub-test'));
+    process.exit(1);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(inputJson);
+  } catch {
+    console.error(pc.red(`Invalid JSON: ${inputJson.slice(0, 80)}`));
+    process.exit(1);
+  }
+
+  // Load scrubber config
+  const { createScrubber, createScrubberFromConfig } = await import('./scrubber.js');
+
+  let scrub: (v: unknown) => unknown;
+
+  if (configArg || customPatterns.length === 0) {
+    // Load from config
+    const origStderr = process.stderr.write.bind(process.stderr);
+    process.stderr.write = () => true;
+    try {
+      const cfg = loadConfig(configArg);
+      const allPatterns = [...(cfg.scrubber.patterns ?? []), ...customPatterns];
+      scrub = createScrubber(allPatterns);
+    } catch {
+      // Config not found — use defaults + custom patterns
+      scrub = createScrubber(customPatterns);
+    }
+    process.stderr.write = origStderr;
+  } else {
+    scrub = createScrubber(customPatterns);
+  }
+
+  const scrubbed = scrub(parsed);
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({ original: parsed, scrubbed }, null, 2));
+    return;
+  }
+
+  // Diff-style output — show what changed
+  const origStr    = JSON.stringify(parsed,   null, 2);
+  const scrubbedStr = JSON.stringify(scrubbed, null, 2);
+
+  if (origStr === scrubbedStr) {
+    console.log(pc.green('✅ No secrets detected — payload would be logged as-is'));
+    console.log(pc.dim(origStr));
+    return;
+  }
+
+  console.log(pc.yellow('⚠️  Secrets detected — redacted fields:'));
+  console.log();
+
+  // Line-by-line comparison — highlight changed lines
+  const origLines     = origStr.split('\n');
+  const scrubbedLines = scrubbedStr.split('\n');
+
+  for (let i = 0; i < Math.max(origLines.length, scrubbedLines.length); i++) {
+    const o = origLines[i] ?? '';
+    const s = scrubbedLines[i] ?? '';
+
+    if (o === s) {
+      console.log(`  ${pc.dim(s)}`);
+    } else {
+      console.log(`  ${pc.red('- ' + o)}`);
+      console.log(`  ${pc.green('+ ' + s)}`);
+    }
+  }
+
+  console.log();
+}
+
 // ─── Command: policy-check ────────────────────────────────────────────────────
 
 async function cmdPolicyCheck(flags: string[]): Promise<void> {
@@ -1386,6 +1500,11 @@ async function main(): Promise<void> {
     case 'policy-check':
     case 'policy':
       await cmdPolicyCheck(argv.slice(1));
+      break;
+
+    case 'scrub-test':
+    case 'scrub':
+      await cmdScrubTest(argv.slice(1));
       break;
 
     default:
