@@ -103,8 +103,49 @@ function printUsage(): void {
 
 // ─── Command: run ─────────────────────────────────────────────────────────────
 
-async function cmdRun(configArg?: string): Promise<void> {
+async function cmdRun(argv: string[]): Promise<void> {
+  // Parse run-specific flags that can override config values
+  // Supported: [config] --mode audit|enforce --log-file <path> --no-rotate
+  let configArg:   string | undefined;
+  let modeOverride:    string | undefined;
+  let logFileOverride: string | undefined;
+  let noRotate         = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const f = argv[i]!;
+    if ((f === '--mode' || f === '-m') && argv[i + 1]) {
+      modeOverride = argv[++i];
+    } else if (f === '--log-file' && argv[i + 1]) {
+      logFileOverride = argv[++i];
+    } else if (f === '--no-rotate') {
+      noRotate = true;
+    } else if (!f.startsWith('-') && configArg == null) {
+      configArg = f;
+    }
+  }
+
   const config = loadConfig(configArg);
+
+  // Apply CLI overrides
+  if (modeOverride) {
+    if (modeOverride !== 'audit' && modeOverride !== 'enforce') {
+      console.error(pc.red(`Invalid --mode value: "${modeOverride}" (must be "audit" or "enforce")`));
+      process.exit(1);
+    }
+    config.mode = modeOverride as 'audit' | 'enforce';
+    process.stderr.write(`[warden:run] mode overridden to "${modeOverride}" by --mode flag\n`);
+  }
+
+  if (logFileOverride) {
+    config.logFile = logFileOverride;
+    process.stderr.write(`[warden:run] logFile overridden to "${logFileOverride}" by --log-file flag\n`);
+  }
+
+  if (noRotate && config.rotate) {
+    config.rotate.enabled = false;
+    process.stderr.write('[warden:run] log rotation disabled by --no-rotate flag\n');
+  }
+
   await runProxy(config);
 }
 
@@ -2753,7 +2794,7 @@ async function main(): Promise<void> {
 
   switch (command) {
     case 'run':
-      await cmdRun(argv[1]);
+      await cmdRun(argv.slice(1));
       break;
 
     case 'kill':
