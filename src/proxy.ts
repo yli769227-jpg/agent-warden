@@ -30,7 +30,7 @@ import { createPolicyEngine } from './policy.js';
 import { createScrubberFromConfig } from './scrubber.js';
 import { createAuditLogger } from './audit.js';
 import { KillSwitch } from './killswitch.js';
-import type { AuditEntry, WardenConfig } from './types.js';
+import type { AuditEntry, ServerConfig, WardenConfig } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -77,22 +77,50 @@ export async function runProxy(config: WardenConfig): Promise<void> {
   // Start watching the sentinel file immediately.
   ks.watch();
 
-  // ── Downstream client ───────────────────────────────────────────────────────
-  const [downstreamExe, ...downstreamArgs] = config.downstreamCommand;
-  const downstreamTransport = new StdioClientTransport({
-    command: downstreamExe,
-    args:    downstreamArgs,
-    // Inherit stderr so downstream server logs surface in the warden process.
-    stderr: 'inherit',
-  });
+  // ── Normalise server list ──────────────────────────────────────────────────
+  // Support both the modern `servers` map and the legacy `downstreamCommand`.
+  const serverMap: Record<string, ServerConfig> = {};
 
-  const client = new Client(
-    { name: 'agent-warden-client', version: '0.1.0' },
-    { capabilities: {} },
-  );
+  if (config.servers && Object.keys(config.servers).length > 0) {
+    Object.assign(serverMap, config.servers);
+  } else if (config.downstreamCommand && config.downstreamCommand.length > 0) {
+    const [command, ...args] = config.downstreamCommand;
+    serverMap['_default'] = { command, args };
+    log('Using legacy downstreamCommand (single server, no tool prefix)');
+  } else {
+    throw new Error('[warden:proxy] No downstream servers configured. Set "servers" or "downstreamCommand" in warden.config.yaml');
+  }
 
-  await client.connect(downstreamTransport);
-  log('Connected to downstream');
+  const serverKeys = Object.keys(serverMap);
+  log(`Connecting to ${serverKeys.length} downstream server(s): ${serverKeys.join(', ')}`);
+
+  // ── Connect all downstream clients ─────────────────────────────────────────
+  const clients: Array<{ key: string; client: Client; prefix: string }> = [];
+
+  for (const [key, serverCfg] of Object.entries(serverMap)) {
+    const transport = new StdioClientTransport({
+      command: serverCfg.command,
+      args:    serverCfg.args ?? [],
+      env:     serverCfg.env
+        ? { ...process.env, ...serverCfg.env } as Record<string, string>
+        : undefined,
+      stderr: 'inherit',
+    });
+
+    const client = new Client(
+      { name: `agent-warden-client-${key}`, version: '0.1.0' },
+      { capabilities: {} },
+    );
+
+    await client.connect(transport);
+    // Single default server → no prefix; named servers → "key/" prefix
+    const prefix = key === '_default' ? '' : `${key}/`;
+    clients.push({ key, client, prefix });
+    log(`Connected to downstream server "${key}"`);
+  }
+
+  // Use the first client for resource/prompt proxying (primary server)
+  const primaryClient = clients[0]!.client;
 
   // ── Upstream MCP server ─────────────────────────────────────────────────────
   const server = new McpServer(
@@ -106,12 +134,15 @@ export async function runProxy(config: WardenConfig): Promise<void> {
     },
   );
 
-  // ── Tool discovery + registration ───────────────────────────────────────────
-  const { tools } = await client.listTools();
-  log(`Discovered ${tools.length} tools from downstream`);
+  // ── Tool discovery + registration (all servers) ─────────────────────────────
+  let totalTools = 0;
+  for (const { key, client, prefix } of clients) {
+    const { tools } = await client.listTools();
+    log(`Discovered ${tools.length} tools from "${key}"`);
+    totalTools += tools.length;
 
   for (const toolDef of tools) {
-    const toolName        = toolDef.name;
+    const toolName        = `${prefix}${toolDef.name}`;
     const toolDescription = toolDef.description ?? '';
 
     /*
@@ -186,10 +217,12 @@ export async function runProxy(config: WardenConfig): Promise<void> {
         }
 
         // ── 3. Forward to downstream ─────────────────────────────────────
+        // Strip the server prefix before forwarding (downstream doesn't know about it)
+        const downstreamToolName = prefix ? toolName.slice(prefix.length) : toolName;
         let downstreamResult: Awaited<ReturnType<typeof client.callTool>>;
         try {
           downstreamResult = await client.callTool({
-            name:      toolName,
+            name:      downstreamToolName,
             arguments: args as Record<string, unknown>,
           });
         } catch (err: unknown) {
@@ -281,18 +314,17 @@ export async function runProxy(config: WardenConfig): Promise<void> {
         } satisfies CallToolResult;
       },
     );
-  }
+  } // end for toolDef
+  } // end for clients
 
-  log(`Registered ${tools.length} tools`);
+  log(`Registered ${totalTools} tools from ${clients.length} server(s)`);
 
-  // ── Transparent resource list proxy ────────────────────────────────────────
-  // Use the underlying Server to install a raw handler so we can forward the
-  // downstream's resource catalogue without re-implementing pagination logic.
+  // ── Transparent resource list proxy (primary server) ───────────────────────
   server.server.setRequestHandler(
     ListResourcesRequestSchema,
     async (request) => {
       try {
-        return await client.listResources(request.params);
+        return await primaryClient.listResources(request.params);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         log(`resources/list error — ${msg}`);
@@ -301,12 +333,12 @@ export async function runProxy(config: WardenConfig): Promise<void> {
     },
   );
 
-  // ── Transparent prompt list proxy ───────────────────────────────────────────
+  // ── Transparent prompt list proxy (primary server) ─────────────────────────
   server.server.setRequestHandler(
     ListPromptsRequestSchema,
     async (request) => {
       try {
-        return await client.listPrompts(request.params);
+        return await primaryClient.listPrompts(request.params);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         log(`prompts/list error — ${msg}`);
@@ -343,10 +375,12 @@ export async function runProxy(config: WardenConfig): Promise<void> {
 
     ks.close();
 
-    try {
-      await client.close();
-    } catch (err: unknown) {
-      log(`client.close error: ${err instanceof Error ? err.message : String(err)}`);
+    for (const { key, client } of clients) {
+      try {
+        await client.close();
+      } catch (err: unknown) {
+        log(`client.close error (${key}): ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     try {

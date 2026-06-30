@@ -72,7 +72,7 @@ scrubber:
     expect(config.scrubber.enabled).toBe(false);
   });
 
-  test('2. missing downstreamCommand — throws descriptive error', () => {
+  test('2. missing servers and downstreamCommand — throws descriptive error', () => {
     const file = writeTmpYaml(
       tmpDir,
       `
@@ -82,8 +82,7 @@ logFile: /tmp/audit.jsonl
     );
 
     expect(() => loadConfig(file)).toThrow(/\[warden:config\]/);
-    expect(() => loadConfig(file)).toThrow(/downstreamCommand/);
-    expect(() => loadConfig(file)).toThrow(/missing or empty/);
+    expect(() => loadConfig(file)).toThrow(/No downstream server configured/);
   });
 
   test('3. partial config merges with defaults — gets default logFile and policy', () => {

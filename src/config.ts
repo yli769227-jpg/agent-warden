@@ -18,13 +18,12 @@ import type { WardenConfig } from './types.js';
 
 /**
  * Sensible defaults merged underneath every loaded config.
- * `downstreamCommand` is intentionally empty — it MUST be supplied in the
- * config file; loadConfig() will throw a descriptive error if it is absent.
+ * Either `servers` or `downstreamCommand` MUST be supplied in the config file;
+ * loadConfig() will throw a descriptive error if both are absent/empty.
  */
 export const DEFAULT_CONFIG: WardenConfig = {
   mode: 'audit',
   logFile: '~/.warden/audit.jsonl',
-  downstreamCommand: [],
   policy: {
     defaultAction: 'allow',
   },
@@ -144,11 +143,21 @@ export function loadConfig(configPath?: string): WardenConfig {
   ) as unknown as WardenConfig;
 
   // ── Validate required fields ───────────────────────────────────────────────
-  const cmd = merged.downstreamCommand;
-  if (!Array.isArray(cmd) || cmd.length === 0) {
+  const hasServers =
+    merged.servers != null && Object.keys(merged.servers).length > 0;
+  const hasLegacyCommand =
+    Array.isArray(merged.downstreamCommand) &&
+    (merged.downstreamCommand as string[]).length > 0;
+
+  if (!hasServers && !hasLegacyCommand) {
     throw new Error(
-      `[warden:config] Required field "downstreamCommand" is missing or empty in "${resolvedPath}".\n` +
-        'Provide the MCP server command and arguments, for example:\n' +
+      `[warden:config] No downstream server configured in "${resolvedPath}".\n` +
+        'Provide either a "servers" map (recommended):\n' +
+        '  servers:\n' +
+        '    filesystem:\n' +
+        '      command: npx\n' +
+        '      args: ["-y", "@modelcontextprotocol/server-filesystem", "/path"]\n' +
+        'Or the legacy single-server "downstreamCommand" array:\n' +
         '  downstreamCommand:\n' +
         '    - npx\n' +
         '    - -y\n' +

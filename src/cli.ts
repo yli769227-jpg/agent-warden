@@ -317,8 +317,18 @@ async function cmdCheck(configArg?: string): Promise<void> {
     console.log(`${pc.red('❌')} Log directory not writable: ${logDir}`);
   }
 
-  // 3. Probe downstream command
-  const cmdParts = config.downstreamCommand;
+  // 3. Probe downstream command(s)
+  // Resolve to the first server command (legacy or first in servers map)
+  let cmdParts: string[];
+  if (config.servers && Object.keys(config.servers).length > 0) {
+    const firstServer = Object.values(config.servers)[0]!;
+    cmdParts = [firstServer.command, ...(firstServer.args ?? [])];
+  } else if (config.downstreamCommand && config.downstreamCommand.length > 0) {
+    cmdParts = config.downstreamCommand;
+  } else {
+    console.log(`${pc.red('❌')} No downstream server configured`);
+    return;
+  }
   const [executable, ...cmdArgs] = cmdParts;
   console.log(`\nProbing downstream: ${pc.cyan(cmdParts.join(' '))}`);
 

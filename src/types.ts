@@ -1,18 +1,46 @@
 /**
+ * Configuration for a single downstream MCP server.
+ *
+ * command: Executable to spawn (e.g. "npx").
+ * args:    Arguments passed to the executable.
+ * env:     Additional environment variables merged into the child process env.
+ */
+export interface ServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+/**
  * Top-level warden configuration.
  *
  * mode:
  *   'audit'   – log every intercepted call but always forward it downstream.
  *   'enforce' – apply policy rules; deny/kill actions are enforced.
+ *
+ * Downstream servers can be declared in two ways:
+ *
+ *   (a) Multi-server (preferred): `servers` maps named keys to ServerConfig.
+ *       Tool names are prefixed with the server key: "filesystem/read_file".
+ *
+ *   (b) Single-server (legacy): `downstreamCommand` is a flat string array.
+ *       Tool names are not prefixed.
+ *
+ * Exactly one of `servers` or `downstreamCommand` must be non-empty.
  */
 export interface WardenConfig {
   mode: 'audit' | 'enforce';
   /**
-   * Shell command (and arguments) used to spawn the downstream MCP server
-   * process.  The first element is the executable; remaining elements are
-   * the arguments.
+   * Named downstream MCP servers (preferred).
+   * Tool names will be prefixed with the server key, e.g. "filesystem/read_file".
    */
-  downstreamCommand: string[];
+  servers?: Record<string, ServerConfig>;
+  /**
+   * @deprecated Use `servers` instead.
+   * Shell command (and arguments) used to spawn a single downstream MCP server.
+   * The first element is the executable; remaining elements are the arguments.
+   */
+  downstreamCommand?: string[];
   /** Absolute or relative path to the JSONL audit log file. */
   logFile: string;
   policy: PolicyConfig;
