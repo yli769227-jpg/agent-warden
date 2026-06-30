@@ -2106,6 +2106,155 @@ async function cmdTokenEstimate(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: latency-percentiles ────────────────────────────────────────────
+
+function computePercentiles(sorted: number[], pcts: number[]): Record<number, number> {
+  const result: Record<number, number> = {};
+  for (const p of pcts) {
+    if (sorted.length === 0) { result[p] = 0; continue; }
+    const idx = Math.ceil((p / 100) * sorted.length) - 1;
+    result[p] = sorted[Math.max(0, Math.min(idx, sorted.length - 1))]!;
+  }
+  return result;
+}
+
+async function cmdLatencyPercentiles(flags: string[]): Promise<void> {
+  // Reports tool call latency percentiles: P50, P75, P90, P95, P99 overall
+  // and per-tool. Useful for spotting slow tools or latency regressions.
+  //
+  // Flags:
+  //   --since/-s <expr>    Start of window (default: last 24h)
+  //   --window/-w <h>      Window in hours (overrides --since)
+  //   --tool/-t <glob>     Filter to matching tools
+  //   --top <N>            Top tools to show per-tool breakdown (default 10)
+  //   --json/-j            Machine-readable output
+
+  let sinceDate: Date | undefined;
+  let toolFilter: string | undefined;
+  let topN       = 10;
+  let jsonOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if ((f === '--window' || f === '-w') && flags[i + 1]) {
+      sinceDate  = new Date(Date.now() - parseFloat(flags[++i]!) * 3_600_000);
+    } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
+      toolFilter = flags[++i];
+    } else if (f === '--top' && flags[i + 1]) {
+      topN       = parseInt(flags[++i]!, 10) || 10;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  if (!sinceDate) sinceDate = new Date(Date.now() - 24 * 3_600_000);
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read log ────────────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  const allMs: number[] = [];
+  const toolMs: Record<string, number[]> = {};
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    const tool = entry.tool ?? '(unknown)';
+    if (toolFilter) {
+      const pattern = toolFilter.replace(/\*/g, '.*').replace(/\?/g, '.');
+      if (!new RegExp(`^${pattern}$`, 'i').test(tool)) continue;
+    }
+
+    if (entry.durationMs == null) continue;
+    const d = entry.durationMs;
+
+    allMs.push(d);
+    if (!toolMs[tool]) toolMs[tool] = [];
+    toolMs[tool]!.push(d);
+  }
+
+  allMs.sort((a, b) => a - b);
+
+  const PCTS = [50, 75, 90, 95, 99];
+  const overall = computePercentiles(allMs, PCTS);
+
+  const byTool = Object.entries(toolMs)
+    .map(([tool, ms]) => {
+      const sorted = [...ms].sort((a, b) => a - b);
+      return {
+        tool,
+        calls:  sorted.length,
+        avg:    Math.round(sorted.reduce((s, v) => s + v, 0) / sorted.length),
+        min:    sorted[0] ?? 0,
+        max:    sorted[sorted.length - 1] ?? 0,
+        pct:    computePercentiles(sorted, PCTS),
+      };
+    })
+    .sort((a, b) => b.pct[95]! - a.pct[95]!)
+    .slice(0, topN);
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:    sinceDate.toISOString(),
+      total:    allMs.length,
+      overall:  { avg: allMs.length ? Math.round(allMs.reduce((s, v) => s + v, 0) / allMs.length) : 0, ...overall },
+      byTool:   byTool.map(t => ({ tool: t.tool, calls: t.calls, avg: t.avg, min: t.min, max: t.max, ...t.pct })),
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  console.log(`\n${pc.bold('warden latency-percentiles')} — ${allMs.length} calls with timing data`);
+  console.log(pc.dim(`  Since ${sinceDate.toISOString()}`));
+  console.log();
+
+  function fmtMs(n: number): string { return `${n}ms`; }
+
+  if (allMs.length === 0) {
+    console.log(pc.dim('  No timing data in this window.'));
+    console.log();
+    return;
+  }
+
+  const avgAll = Math.round(allMs.reduce((s, v) => s + v, 0) / allMs.length);
+  console.log(`  Overall (${allMs.length} calls):`);
+  console.log(`    avg=${fmtMs(avgAll)}  p50=${fmtMs(overall[50]!)}  p75=${fmtMs(overall[75]!)}  p90=${fmtMs(overall[90]!)}  p95=${fmtMs(overall[95]!)}  p99=${fmtMs(overall[99]!)}`);
+  console.log();
+
+  if (byTool.length > 0) {
+    console.log(`  ${pc.bold(`Per-tool breakdown (top ${byTool.length} by P95):`)}`);
+    const toolColW = Math.max(10, ...byTool.map(t => t.tool.length)) + 2;
+    console.log(pc.dim(`    ${'Tool'.padEnd(toolColW)} calls   avg   P50   P75   P90   P95   P99`));
+    for (const t of byTool) {
+      const p95colour = t.pct[95]! >= 500 ? pc.red : t.pct[95]! >= 200 ? pc.yellow : pc.green;
+      console.log(
+        `    ${t.tool.padEnd(toolColW)}` +
+        `${String(t.calls).padStart(5)}  ` +
+        `${fmtMs(t.avg).padStart(6)}  ` +
+        `${fmtMs(t.pct[50]!).padStart(6)}  ` +
+        `${fmtMs(t.pct[75]!).padStart(6)}  ` +
+        `${fmtMs(t.pct[90]!).padStart(6)}  ` +
+        p95colour(`${fmtMs(t.pct[95]!).padStart(6)}`) + `  ` +
+        `${fmtMs(t.pct[99]!).padStart(6)}`,
+      );
+    }
+    console.log();
+  }
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -5887,6 +6036,11 @@ async function main(): Promise<void> {
 
     case 'token-estimate':
       await cmdTokenEstimate(argv.slice(1));
+      break;
+
+    case 'latency-percentiles':
+    case 'latency':
+      await cmdLatencyPercentiles(argv.slice(1));
       break;
 
     default:
