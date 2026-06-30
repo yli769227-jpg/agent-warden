@@ -207,6 +207,12 @@ scrubber:
 | `warden report` | Generate a Markdown audit summary (`--output`, `--since`, `--title`) |
 | `warden summary` | Plain-English security summary for stakeholders (`--since`, `--title`, `--output`, `--json`) |
 | `warden export-html` | Generate a self-contained interactive HTML report (`--output`, `--title`, `--since`, `--open`) |
+| `warden token-estimate` | Estimate LLM input tokens consumed by tool args (`--since`, `--tool`, `--json`) |
+| `warden session-summary` | Cluster calls into sessions and report per-session risk (`--gap-mins`, `--last`, `--json`) |
+| `warden alert-history` | Incident log of all deny/kill events, with burst clustering (`--burst-secs`, `--verdict`, `--json`) |
+| `warden policy-stats` | Policy rule hit analysis — which rules fire, which are dead (`--since`, `--json`) |
+| `warden redact-scan` | Post-hoc secret leak detector — scan log for unredacted tokens/keys (`--exit-code`, `--json`) |
+| `warden verify-integrity` | Check audit log for tampering: JSON validity, required fields, timestamp monotonicity (`--strict-exit`) |
 
 ### CI/CD
 
@@ -218,6 +224,13 @@ scrubber:
 | `warden replay` | Re-evaluate historical entries against current policy (`--config`, `--diff-only`, `--json`) |
 | `warden bench` | Measure per-call policy+scrubber overhead (`--iterations N`, `--json`) |
 
+### Log Management
+
+| Command | Description |
+|---|---|
+| `warden rotate` | Manually rotate the audit log (`--list`, `--no-compress`) |
+| `warden archive` | Compress old entries to gzip, trim live log, write index (`--before`, `--dry-run`, `--index`) |
+
 ### Debugging
 
 | Command | Description |
@@ -225,6 +238,7 @@ scrubber:
 | `warden policy-check` | Dry-run a tool call through the policy engine (`--args`, `--json`) |
 | `warden scrub-test` | Preview which fields in a payload would be redacted (`--input`, `--json`) |
 | `warden alert-test` | Send test webhook to all configured targets (`--url`, `--json`) |
+| `warden latency-percentiles` | P50/P75/P90/P95/P99 latency report per tool (`--since`, `--top`, `--json`) |
 | `warden version` | Print version |
 
 ---

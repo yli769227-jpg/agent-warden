@@ -58,6 +58,20 @@ jobs:
           WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js summary --window 48 --json
           WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js snapshot --output /tmp/snap.json --window 48
           WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js ci-check --window 48 --max-deny-rate 100 --allow-dangerous || true
+          # New commands smoke tests
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js heat-map --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js trending --window 48 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js blame --window 48 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js scope --window 48 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js session-summary --since 2026-01-01 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js alert-history --since 2026-01-01 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js token-estimate --since 2026-01-01 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js latency-percentiles --since 2026-01-01 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js policy-stats --since 2026-01-01 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js redact-scan --since 2026-01-01 --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js verify-integrity --json
+          WARDEN_LOG=$LOG node $GITHUB_WORKSPACE/dist/cli.js export-html --output /tmp/report.html --title "CI Test"
+          test -f /tmp/report.html
 
       - name: Upload test results
         if: always() && matrix.node-version == '22.x'
