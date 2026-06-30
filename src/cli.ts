@@ -43,7 +43,7 @@ function printUsage(): void {
       `  ${pc.cyan('kill [reason]')}     Arm the kill switch — all tool calls denied`,
       `  ${pc.cyan('unkill')}            Disarm the kill switch`,
       `  ${pc.cyan('log')}               Tail the audit log (--tool, --verdict, --since, --no-follow, --json)`,
-      `  ${pc.cyan('stats')}             Show audit statistics (counts by verdict / tool)`,
+      `  ${pc.cyan('stats')}             Show audit statistics (--since, --json for machine output)`,
       `  ${pc.cyan('check [config]')}    Verify config and downstream server reachability`,
       `  ${pc.cyan('init')}              Write a starter warden.config.yaml in the current directory`,
       '',
@@ -278,20 +278,37 @@ async function cmdLog(flags: string[]): Promise<void> {
 
 // ─── Command: stats ───────────────────────────────────────────────────────────
 
-async function cmdStats(): Promise<void> {
+async function cmdStats(flags: string[]): Promise<void> {
+  // Parse flags: --since <spec>, --json
+  let since: Date | undefined;
+  let jsonMode = false;
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === '--json' || f === '-j') {
+      jsonMode = true;
+    } else if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      since = parseSince(flags[++i]!);
+    }
+  }
+
   const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
 
   if (!fs.existsSync(logFile)) {
-    console.error(pc.yellow(`Log file not found: ${logFile}`));
+    if (jsonMode) {
+      process.stdout.write(JSON.stringify({ error: 'log file not found', logFile }) + '\n');
+    } else {
+      console.error(pc.yellow(`Log file not found: ${logFile}`));
+    }
     process.exit(1);
   }
 
   const content = fs.readFileSync(logFile, 'utf8');
-  const lines = content.split('\n').filter((l) => l.trim());
+  const lines   = content.split('\n').filter((l) => l.trim());
 
-  const byVerdict: Record<string, number> = {};
-  const byTool: Record<string, number> = {};
-  let total = 0;
+  const byVerdict:    Record<string, number> = {};
+  const byTool:       Record<string, number> = {};
+  const avgDurationByTool: Record<string, number[]> = {};
+  let total       = 0;
   let parseErrors = 0;
 
   for (const line of lines) {
@@ -303,15 +320,47 @@ async function cmdStats(): Promise<void> {
       continue;
     }
 
+    // Apply --since filter
+    if (since && entry.ts && new Date(entry.ts) < since) continue;
+
     total++;
     const v = entry.verdict ?? 'unknown';
     byVerdict[v] = (byVerdict[v] ?? 0) + 1;
 
     const t = entry.tool ?? '<unknown>';
     byTool[t] = (byTool[t] ?? 0) + 1;
+    if (entry.durationMs != null) {
+      (avgDurationByTool[t] ??= []).push(entry.durationMs);
+    }
   }
 
-  console.log(`\n${pc.bold('Audit Log Stats')} — ${logFile}`);
+  // ── JSON output ─────────────────────────────────────────────────────────────
+  if (jsonMode) {
+    const topTools = Object.entries(byTool)
+      .sort(([, a], [, b]) => b - a)
+      .slice(0, 50)
+      .map(([tool, count]) => ({
+        tool,
+        count,
+        avgDurationMs: avgDurationByTool[tool]
+          ? Math.round(avgDurationByTool[tool]!.reduce((a, b) => a + b, 0) / avgDurationByTool[tool]!.length)
+          : null,
+      }));
+
+    process.stdout.write(JSON.stringify({
+      logFile,
+      since:        since?.toISOString() ?? null,
+      total,
+      parseErrors,
+      byVerdict,
+      topTools,
+    }, null, 2) + '\n');
+    return;
+  }
+
+  // ── Human-readable output ────────────────────────────────────────────────────
+  const sinceLabel = since ? ` (since ${since.toISOString()})` : '';
+  console.log(`\n${pc.bold('Audit Log Stats')} — ${logFile}${sinceLabel}`);
   console.log(pc.dim(`Total entries : ${total}`));
   if (parseErrors > 0) {
     console.log(pc.yellow(`Parse errors  : ${parseErrors}`));
@@ -323,28 +372,19 @@ async function cmdStats(): Promise<void> {
   const verdictOrder = ['allow', 'deny', 'killed'];
   const sortedVerdicts = [
     ...verdictOrder.filter((v) => v in byVerdict),
-    ...Object.keys(byVerdict)
-      .filter((v) => !verdictOrder.includes(v))
-      .sort(),
+    ...Object.keys(byVerdict).filter((v) => !verdictOrder.includes(v)).sort(),
   ];
 
   for (const verdict of sortedVerdicts) {
     const count = byVerdict[verdict] ?? 0;
-    const pct = total > 0 ? ((count / total) * 100).toFixed(1) : '0.0';
+    const pct   = total > 0 ? ((count / total) * 100).toFixed(1) : '0.0';
 
     let label: string;
     switch (verdict) {
-      case 'allow':
-        label = pc.green(verdict.padEnd(8));
-        break;
-      case 'deny':
-        label = pc.red(verdict.padEnd(8));
-        break;
-      case 'killed':
-        label = pc.bgRed(pc.white(verdict.padEnd(8)));
-        break;
-      default:
-        label = pc.yellow(verdict.padEnd(8));
+      case 'allow':  label = pc.green(verdict.padEnd(8));                break;
+      case 'deny':   label = pc.red(verdict.padEnd(8));                  break;
+      case 'killed': label = pc.bgRed(pc.white(verdict.padEnd(8)));      break;
+      default:       label = pc.yellow(verdict.padEnd(8));
     }
 
     console.log(`  ${label}  ${String(count).padStart(7)}  (${pct}%)`);
@@ -358,9 +398,11 @@ async function cmdStats(): Promise<void> {
   if (topTools.length > 0) {
     console.log(`\n${pc.bold('By Tool (top 20):')}`);
     for (const [tool, count] of topTools) {
-      const pct = total > 0 ? ((count / total) * 100).toFixed(1) : '0.0';
+      const pct  = total > 0 ? ((count / total) * 100).toFixed(1) : '0.0';
+      const durs = avgDurationByTool[tool];
+      const avg  = durs ? ` avg ${Math.round(durs.reduce((a, b) => a + b, 0) / durs.length)}ms` : '';
       console.log(
-        `  ${pc.cyan(tool.padEnd(32))}  ${String(count).padStart(7)}  (${pct}%)`,
+        `  ${pc.cyan(tool.padEnd(36))}  ${String(count).padStart(6)}  (${pct}%)${pc.dim(avg)}`,
       );
     }
   }
@@ -577,7 +619,7 @@ async function main(): Promise<void> {
       break;
 
     case 'stats':
-      await cmdStats();
+      await cmdStats(argv.slice(1));
       break;
 
     case 'check':
