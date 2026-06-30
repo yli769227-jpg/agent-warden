@@ -500,6 +500,9 @@ rules:
 - [x] `warden log --grep` — regex filter across entire audit entry
 - [x] `warden timeline` — ASCII bar chart of tool call activity over time
 - [x] `warden server-list` — list all available tools across configured MCP servers
+- [x] `warden doctor` — comprehensive health check (`brew doctor`-style with hints)
+- [x] `warden run --mode/--log-file/--no-rotate` — runtime overrides without editing config
+- [x] 300 unit + integration tests across 24 test suites
 - [ ] Web dashboard — local browser UI to view audit log and visualize call patterns
 - [ ] OPA integration — use Open Policy Agent `.rego` files as the policy engine
 - [ ] OpenTelemetry export — emit audit entries as OTEL spans
@@ -513,7 +516,7 @@ git clone https://github.com/yli769227-jpg/agent-warden.git
 cd agent-warden
 npm install --include=optional
 npm run build
-npm test              # 185 tests (172 unit + 13 integration)
+npm test              # 300 tests (287 unit + 13 integration)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow and PR checklist.
