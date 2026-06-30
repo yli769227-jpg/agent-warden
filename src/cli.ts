@@ -66,6 +66,7 @@ function printUsage(): void {
       `  ${pc.cyan('check [config]')}    Verify config and downstream server reachability`,
       `  ${pc.cyan('init')}              Write a starter warden.config.yaml in the current directory`,
       `  ${pc.cyan('version')}           Print version and exit`,
+      `  ${pc.cyan('export [config]')}   Export audit log to CSV (--output, --since, --tool, --verdict)`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -656,6 +657,89 @@ scrubber:
   console.log(`Edit the file, then start the proxy with: ${pc.cyan('warden run')}`);
 }
 
+// ─── Command: export ──────────────────────────────────────────────────────────
+
+/** Escape a CSV field: wrap in quotes if it contains comma, quote, or newline. */
+function csvField(value: unknown): string {
+  const str = value == null ? '' : typeof value === 'string' ? value : JSON.stringify(value);
+  if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+async function cmdExport(flags: string[]): Promise<void> {
+  // Flags: --output/-o <file>, --since/-s, --tool/-t, --verdict/-v
+  let outputPath: string | undefined;
+  const filter: LogFilter = { follow: false, json: false };
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--output' || f === '-o') && flags[i + 1]) {
+      outputPath = flags[++i];
+    } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
+      filter.tool = flags[++i];
+    } else if ((f === '--verdict' || f === '-v') && flags[i + 1]) {
+      filter.verdict = flags[++i];
+    } else if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      filter.since = parseSince(flags[++i]!);
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  const CSV_HEADER = 'ts,tool,verdict,durationMs,reason,dangerous,args\n';
+
+  const dest = outputPath ? fs.createWriteStream(outputPath, { encoding: 'utf8' }) : process.stdout;
+
+  if (outputPath) dest.write(CSV_HEADER);
+  else process.stdout.write(CSV_HEADER);
+
+  const readStream = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: readStream, crlfDelay: Infinity });
+
+  let rowCount = 0;
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    if (!entryMatchesFilter(line, filter)) continue;
+
+    let entry: AuditEntry;
+    try {
+      entry = JSON.parse(line) as AuditEntry;
+    } catch {
+      continue;
+    }
+
+    const row = [
+      csvField(entry.ts),
+      csvField(entry.tool),
+      csvField(entry.verdict),
+      csvField(entry.durationMs),
+      csvField((entry as unknown as Record<string, unknown>)['reason']),
+      csvField((entry as unknown as Record<string, unknown>)['dangerous']),
+      csvField(JSON.stringify(entry.args)),
+    ].join(',') + '\n';
+
+    if (outputPath) (dest as fs.WriteStream).write(row);
+    else process.stdout.write(row);
+
+    rowCount++;
+  }
+
+  if (outputPath) {
+    (dest as fs.WriteStream).end();
+    console.error(pc.green(`✅ Exported ${rowCount} rows → ${outputPath}`));
+  } else {
+    process.stderr.write(pc.dim(`${rowCount} rows exported\n`));
+  }
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -704,6 +788,10 @@ async function main(): Promise<void> {
 
     case 'version':
       console.log(VERSION);
+      break;
+
+    case 'export':
+      await cmdExport(argv.slice(1));
       break;
 
     default:
