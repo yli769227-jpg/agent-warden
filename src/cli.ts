@@ -3438,6 +3438,173 @@ async function cmdCostEstimate(flags: string[]): Promise<void> {
   console.log();
 }
 
+// ─── Command: access-pattern ──────────────────────────────────────────────────
+
+// Keys to extract resource paths/names from args
+const ACCESS_PATH_KEYS = new Set([
+  'path', 'file', 'filepath', 'filename', 'dir', 'directory',
+  'src', 'dest', 'source', 'destination', 'target', 'location',
+]);
+
+// Infer "access type" from tool name heuristics
+function inferAccessType(tool: string): 'read' | 'write' | 'exec' | 'other' {
+  const t = tool.toLowerCase();
+  if (/read|get|list|fetch|search|find|stat|ls|cat|head/.test(t)) return 'read';
+  if (/write|put|post|create|update|patch|delete|rm|mv|copy|append|save|push|upload/.test(t)) return 'write';
+  if (/exec|run|call|invoke|bash|shell|cmd|spawn/.test(t)) return 'exec';
+  return 'other';
+}
+
+async function cmdAccessPattern(flags: string[]): Promise<void> {
+  // Analyzes resource access patterns from tool call args.
+  // Extracts path/file/dir values from args, then shows:
+  //   - Which paths are accessed most
+  //   - Read/write/exec breakdown per path
+  //   - Denial rate per path
+  //
+  // Flags:
+  //   --since/-s <expr>   Start of window (default: last 24h)
+  //   --top <N>           Top paths to show (default: 20)
+  //   --min-count <N>     Only paths with >= N accesses (default: 1)
+  //   --tool/-t <name>    Filter by tool name prefix
+  //   --json/-j           Machine-readable output
+
+  let sinceDate: Date | undefined;
+  let topN        = 20;
+  let minCount    = 1;
+  let toolFilter  = '';
+  let jsonOutput  = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if (f === '--top' && flags[i + 1]) {
+      topN       = parseInt(flags[++i]!, 10) || 20;
+    } else if (f === '--min-count' && flags[i + 1]) {
+      minCount   = parseInt(flags[++i]!, 10) || 1;
+    } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
+      toolFilter = flags[++i]!;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  if (!sinceDate) sinceDate = new Date(Date.now() - 24 * 3_600_000);
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read entries ──────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  type PathStat = {
+    resource: string;
+    total:    number;
+    read:     number;
+    write:    number;
+    exec:     number;
+    other:    number;
+    denied:   number;
+    tools:    Map<string, number>;
+  };
+
+  const pathMap = new Map<string, PathStat>();
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+    if (!entry.ts || new Date(entry.ts) < sinceDate) continue;
+
+    const tool = entry.tool ?? '(unknown)';
+    if (toolFilter && !tool.startsWith(toolFilter)) continue;
+
+    // Extract path values from args
+    if (!entry.args || typeof entry.args !== 'object') continue;
+    const args = entry.args as Record<string, unknown>;
+
+    const denied      = entry.verdict === 'deny' || entry.verdict === 'killed';
+    const accessType  = inferAccessType(tool);
+
+    const resources: string[] = [];
+    for (const [k, v] of Object.entries(args)) {
+      if (ACCESS_PATH_KEYS.has(k) && typeof v === 'string' && v.length > 0) {
+        resources.push(v);
+      }
+    }
+
+    for (const resource of resources) {
+      if (!pathMap.has(resource)) {
+        pathMap.set(resource, { resource, total: 0, read: 0, write: 0, exec: 0, other: 0, denied: 0, tools: new Map() });
+      }
+      const ps = pathMap.get(resource)!;
+      ps.total++;
+      ps[accessType]++;
+      if (denied) ps.denied++;
+      ps.tools.set(tool, (ps.tools.get(tool) ?? 0) + 1);
+    }
+  }
+
+  const results = [...pathMap.values()]
+    .filter(p => p.total >= minCount)
+    .sort((a, b) => b.total - a.total)
+    .slice(0, topN)
+    .map(p => ({
+      resource: p.resource,
+      total:    p.total,
+      read:     p.read,
+      write:    p.write,
+      exec:     p.exec,
+      other:    p.other,
+      denied:   p.denied,
+      denyRate: p.total > 0 ? Math.round(p.denied / p.total * 100) : 0,
+      topTools: [...p.tools.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([t, c]) => ({ tool: t, count: c })),
+    }));
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:     sinceDate.toISOString(),
+      toolFilter: toolFilter || null,
+      total:     results.length,
+      resources: results,
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  console.log(`\n${pc.bold('warden access-pattern')} — resource access analysis`);
+  console.log(pc.dim(`  Since ${sinceDate.toISOString()} · ${results.length} unique resources`));
+  console.log();
+
+  if (results.length === 0) {
+    console.log(pc.dim('  No resource paths found in tool args.'));
+    console.log();
+    return;
+  }
+
+  const maxTotal = results[0]!.total;
+  for (const r of results) {
+    const bar = '█'.repeat(Math.ceil(r.total / maxTotal * 20));
+    const parts = [
+      r.read  > 0 ? `r:${r.read}`   : '',
+      r.write > 0 ? `w:${r.write}`  : '',
+      r.exec  > 0 ? `x:${r.exec}`   : '',
+    ].filter(Boolean).join(' ');
+    const denyStr = r.denied > 0 ? pc.red(` ✗${r.denied}`) : '';
+    console.log(`  ${String(r.total).padStart(5)}  ${pc.dim(bar.padEnd(20))}  ${r.resource}  ${pc.dim(parts)}${denyStr}`);
+  }
+  console.log();
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -7256,6 +7423,10 @@ async function main(): Promise<void> {
 
     case 'cost-estimate':
       await cmdCostEstimate(argv.slice(1));
+      break;
+
+    case 'access-pattern':
+      await cmdAccessPattern(argv.slice(1));
       break;
 
     default:
