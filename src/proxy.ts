@@ -361,6 +361,53 @@ export async function runProxy(config: WardenConfig): Promise<void> {
 
   log(`Registered ${totalTools} tools from ${clients.length} server(s)`);
 
+  // ── Built-in warden_status tool ───────────────────────────────────────────
+  // Lets Claude (or any MCP client) query the warden instance it's talking to.
+  server.registerTool(
+    'warden_status',
+    {
+      description:
+        'Query the agent-warden proxy for its current status: mode, kill switch state, ' +
+        'rate-limit snapshots, and audit log path. Use this to check whether warden is ' +
+        'active and what policy is in force before performing sensitive operations.',
+      inputSchema: z.object({}),
+    },
+    async () => {
+      const ksState = ks.getState();
+      const rlSnap  = rateLimiter?.snapshot() ?? [];
+
+      const status = {
+        version:   '0.1.0',
+        mode:      config.mode,
+        logFile:   config.logFile,
+        killSwitch: {
+          active: ksState.killed,
+          reason: ksState.reason ?? null,
+          killedAt: ksState.killedAt ?? null,
+        },
+        servers:      Object.keys(serverMap),
+        rateLimit: {
+          enabled: config.rateLimit?.enabled ?? false,
+          buckets: rlSnap,
+        },
+        policy: {
+          defaultAction: config.policy.defaultAction,
+          ruleCount:     config.policy.rules?.length ?? 0,
+        },
+        scrubber: {
+          enabled: config.scrubber.enabled,
+        },
+      };
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify(status, null, 2),
+        }],
+      };
+    },
+  );
+
   // ── Transparent resource list proxy (primary server) ───────────────────────
   server.server.setRequestHandler(
     ListResourcesRequestSchema,
