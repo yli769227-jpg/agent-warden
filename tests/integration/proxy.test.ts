@@ -540,3 +540,108 @@ await runProxy(config).catch(err => { process.stderr.write('ERR: ' + err.message
     }
   });
 });
+
+describe('Rate limiting', () => {
+  test('11. Rate limit enforced — blocked after capacity exhausted', async () => {
+    const dir     = makeTestDir('test11');
+    const logFile = path.join(dir, 'audit.jsonl');
+    const config  = {
+      ...singleServerConfig(logFile),
+      rateLimit: {
+        enabled: true,
+        rules: [
+          { tool: 'echo_tool', capacity: 2, windowMs: 10_000 },
+        ],
+      },
+    };
+
+    const { client, cleanup } = await spawnWarden(config);
+    try {
+      // First 2 calls pass through
+      const r1 = await client.callTool({ name: 'echo_tool', arguments: { message: 'call-1' } });
+      expect((r1 as { isError?: boolean }).isError).toBeFalsy();
+
+      const r2 = await client.callTool({ name: 'echo_tool', arguments: { message: 'call-2' } });
+      expect((r2 as { isError?: boolean }).isError).toBeFalsy();
+
+      // 3rd call is rate-limited
+      const r3 = await client.callTool({ name: 'echo_tool', arguments: { message: 'call-3' } });
+      expect((r3 as { isError?: boolean }).isError).toBe(true);
+      const text = (r3 as { content: Array<{ text: string }> }).content[0]?.text ?? '';
+      expect(text).toMatch(/[Rr]ate limit/i);
+
+      // Verify audit log has a "deny" entry for the rate-limited call
+      await delay(150);
+      if (fs.existsSync(logFile)) {
+        const entries = fs.readFileSync(logFile, 'utf8')
+          .trim().split('\n').filter(Boolean)
+          .map(l => JSON.parse(l) as { verdict: string; tool: string });
+        const denied = entries.filter(e => e.verdict === 'deny' && e.tool === 'echo_tool');
+        expect(denied.length).toBeGreaterThanOrEqual(1);
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test('12. Rate limit refill — calls resume after window refills', async () => {
+    const dir     = makeTestDir('test12');
+    const logFile = path.join(dir, 'audit.jsonl');
+    const config  = {
+      ...singleServerConfig(logFile),
+      rateLimit: {
+        enabled: true,
+        rules: [
+          // Tight 200ms window — refills fast enough to test in CI
+          { tool: 'echo_tool', capacity: 1, windowMs: 200 },
+        ],
+      },
+    };
+
+    const { client, cleanup } = await spawnWarden(config);
+    try {
+      // First call passes
+      const r1 = await client.callTool({ name: 'echo_tool', arguments: { message: 'first' } });
+      expect((r1 as { isError?: boolean }).isError).toBeFalsy();
+
+      // Second call immediately is blocked
+      const r2 = await client.callTool({ name: 'echo_tool', arguments: { message: 'blocked' } });
+      expect((r2 as { isError?: boolean }).isError).toBe(true);
+
+      // Wait for refill
+      await delay(250);
+
+      // After refill, call passes again
+      const r3 = await client.callTool({ name: 'echo_tool', arguments: { message: 'resumed' } });
+      expect((r3 as { isError?: boolean }).isError).toBeFalsy();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test('13. Unmatched tool not rate-limited even when other rules exist', async () => {
+    const dir     = makeTestDir('test13');
+    const logFile = path.join(dir, 'audit.jsonl');
+    const config  = {
+      ...singleServerConfig(logFile),
+      rateLimit: {
+        enabled: true,
+        rules: [
+          // Only limit "nonexistent_tool" — echo_tool should be unlimited
+          { tool: 'nonexistent_tool', capacity: 1, windowMs: 10_000 },
+        ],
+      },
+    };
+
+    const { client, cleanup } = await spawnWarden(config);
+    try {
+      // Call echo_tool many times — should never be blocked
+      for (let i = 0; i < 5; i++) {
+        const r = await client.callTool({ name: 'echo_tool', arguments: { message: `call-${i}` } });
+        expect((r as { isError?: boolean }).isError).toBeFalsy();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+});
