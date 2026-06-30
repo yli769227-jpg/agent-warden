@@ -3,32 +3,13 @@ import { jest } from '@jest/globals';
 import { createPolicyEngine } from '../../src/policy.js';
 import type { PolicyConfig } from '../../src/types.js';
 
-// ---------------------------------------------------------------------------
-// Runtime shape helpers
-//
-// NOTE: The compiled policy.js reads `rule.pattern` for glob matching and
-// accesses `config.mode` / `config.cwd` for dangerous-tool handling.
-// These fields are not currently declared on PolicyConfig / PolicyRule in
-// types.ts (which uses `tool` instead of `pattern`).  The casts below let us
-// construct valid runtime configs while keeping TypeScript happy in the test
-// file itself.
-// ---------------------------------------------------------------------------
-
-type RuntimeRule = {
-  pattern: string;
-  action: 'allow' | 'deny';
-  reason?: string;
-};
-
-type RuntimeConfig = {
+/** Small helper so test configs are concise. */
+const cfg = (c: {
   defaultAction: 'allow' | 'deny';
-  rules: RuntimeRule[];
+  rules: { tool: string; action: 'allow' | 'deny'; reason?: string }[];
   mode?: 'audit' | 'enforce';
   cwd?: string;
-};
-
-/** Cast a RuntimeConfig to PolicyConfig so TypeScript accepts it. */
-const cfg = (c: RuntimeConfig): PolicyConfig => c as unknown as PolicyConfig;
+}): PolicyConfig => c as unknown as PolicyConfig;
 
 // ---------------------------------------------------------------------------
 // Test suite
@@ -76,7 +57,7 @@ describe('createPolicyEngine', () => {
     const engine = createPolicyEngine(
       cfg({
         defaultAction: 'deny', // deny by default so the rule is what grants access
-        rules: [{ pattern: 'read_file', action: 'allow' }],
+        rules: [{ tool: 'read_file', action: 'allow' }],
       }),
     );
     const decision = engine.evaluate('read_file', {});
@@ -89,7 +70,7 @@ describe('createPolicyEngine', () => {
     const engine = createPolicyEngine(
       cfg({
         defaultAction: 'allow',
-        rules: [{ pattern: 'delete_file', action: 'deny' }],
+        rules: [{ tool: 'delete_file', action: 'deny' }],
       }),
     );
     const decision = engine.evaluate('delete_file', {});
@@ -105,7 +86,7 @@ describe('createPolicyEngine', () => {
     const engine = createPolicyEngine(
       cfg({
         defaultAction: 'allow',
-        rules: [{ pattern: '*delete*', action: 'deny' }],
+        rules: [{ tool: '*delete*', action: 'deny' }],
       }),
     );
     const decision = engine.evaluate('bulk_delete_records', {});
@@ -119,8 +100,8 @@ describe('createPolicyEngine', () => {
       cfg({
         defaultAction: 'deny',
         rules: [
-          { pattern: 'read_file', action: 'allow' },
-          { pattern: 'read_file', action: 'deny' },
+          { tool: 'read_file', action: 'allow' },
+          { tool: 'read_file', action: 'deny' },
         ],
       }),
     );
@@ -166,7 +147,7 @@ describe('createPolicyEngine', () => {
     const engine = createPolicyEngine(
       cfg({
         defaultAction: 'allow',
-        rules: [{ pattern: 'read_file', action: 'deny' }],
+        rules: [{ tool: 'read_file', action: 'deny' }],
       }),
     );
     // Pattern 'read_file' must NOT match 'READ_FILE'; tool falls through to default (allow).
