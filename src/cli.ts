@@ -2532,6 +2532,132 @@ async function cmdArchive(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: redact-scan ─────────────────────────────────────────────────────
+
+interface RedactFinding {
+  lineNo:   number;
+  ts:       string;
+  tool:     string;
+  field:    string;
+  match:    string;   // first 60 chars of matched value
+  category: string;
+}
+
+const REDACT_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
+  { name: 'AWS Access Key',      pattern: /AKIA[0-9A-Z]{16}/g },
+  { name: 'AWS Secret Key',      pattern: /(?<![A-Z0-9])[A-Za-z0-9+/]{40}(?![A-Za-z0-9+/])/g },
+  { name: 'GitHub Token',        pattern: /(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}/g },
+  { name: 'Bearer Token',        pattern: /Bearer\s+[A-Za-z0-9._\-]{20,}/g },
+  { name: 'Private Key Header',  pattern: /-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY/g },
+  { name: 'JWT',                 pattern: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g },
+  { name: 'Password in URL',     pattern: /:[^:@\s]{6,}@(?:[a-z0-9.-]+\.[a-z]{2,})/gi },
+  { name: 'Slack Token',         pattern: /xox[baprs]-[A-Za-z0-9-]{10,}/g },
+];
+
+async function cmdRedactScan(flags: string[]): Promise<void> {
+  // Scans the live audit log for potential secrets that may have slipped through
+  // the scrubber. Produces a list of suspicious matches with line numbers.
+  //
+  // This is a post-hoc audit; it does NOT modify the log. It reports findings
+  // so the user can rotate the affected credentials and improve scrubber config.
+  //
+  // Flags:
+  //   --since/-s <expr>   Start of window (default: all)
+  //   --limit <N>         Max findings to report (default: 100)
+  //   --json/-j           Machine-readable output
+  //   --exit-code         Exit 1 if any findings are found (for CI use)
+
+  let sinceDate: Date | undefined;
+  let limit      = 100;
+  let jsonOutput = false;
+  let exitOnFind = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if (f === '--limit' && flags[i + 1]) {
+      limit      = parseInt(flags[++i]!, 10) || 100;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if (f === '--exit-code') {
+      exitOnFind = true;
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Scan log ───────────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  const findings: RedactFinding[] = [];
+  let lineNo = 0;
+
+  for await (const line of rl) {
+    lineNo++;
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (sinceDate && entry.ts && new Date(entry.ts) < sinceDate) continue;
+    if (findings.length >= limit) break;
+
+    // Scan all string fields
+    const payload = JSON.stringify({ args: entry.args, reason: entry.reason });
+    for (const { name, pattern } of REDACT_PATTERNS) {
+      pattern.lastIndex = 0;
+      const m = pattern.exec(payload);
+      if (m) {
+        findings.push({
+          lineNo,
+          ts:       entry.ts ?? '',
+          tool:     entry.tool ?? '(unknown)',
+          field:    'args',
+          match:    m[0].slice(0, 60),
+          category: name,
+        });
+      }
+    }
+  }
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({ logFile, total: findings.length, findings }, null, 2));
+    if (exitOnFind && findings.length > 0) process.exit(1);
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  console.log(`\n${pc.bold('warden redact-scan')} — secret leak detector`);
+  console.log(pc.dim(`  Log: ${logFile}`));
+  console.log();
+
+  if (findings.length === 0) {
+    console.log(`${pc.green('✓')} No potential secrets found.`);
+    console.log();
+    return;
+  }
+
+  console.log(pc.red(`⚠ ${findings.length} potential secret(s) found:`));
+  console.log();
+  for (const f of findings) {
+    console.log(`  Line ${f.lineNo}  ${pc.bold(f.category)}`);
+    console.log(`    Tool:  ${f.tool}`);
+    console.log(`    Time:  ${f.ts}`);
+    console.log(`    Match: ${pc.dim(f.match.length < f.match.length ? f.match + '…' : f.match)}`);
+    console.log();
+  }
+  console.log(pc.dim('  Rotate the affected credentials and check your scrubber config.'));
+  console.log();
+
+  if (exitOnFind) process.exit(1);
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -6326,6 +6452,10 @@ async function main(): Promise<void> {
 
     case 'archive':
       await cmdArchive(argv.slice(1));
+      break;
+
+    case 'redact-scan':
+      await cmdRedactScan(argv.slice(1));
       break;
 
     default:
