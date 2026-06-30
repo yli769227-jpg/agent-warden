@@ -2907,6 +2907,178 @@ async function cmdChain(flags: string[]): Promise<void> {
   console.log();
 }
 
+// ─── Command: top-denied ──────────────────────────────────────────────────────
+
+async function cmdTopDenied(flags: string[]): Promise<void> {
+  // Ranks tools by denial count and shows the reasons behind each denial.
+  // Useful for debugging overly-aggressive policy rules and finding what the
+  // agent tries to do but keeps getting blocked on.
+  //
+  // Output: two ranked tables
+  //   1. Tools — by total deny+kill count, with allow rate
+  //   2. Reasons — by total deny+kill count, with affected tools
+  //
+  // Flags:
+  //   --since/-s <expr>   Start of window (default: last 24h)
+  //   --top <N>           Top entries to show in each table (default: 10)
+  //   --min-count <N>     Only show entries with >= N denials (default: 1)
+  //   --json/-j           Machine-readable output
+
+  let sinceDate: Date | undefined;
+  let topN      = 10;
+  let minCount  = 1;
+  let jsonOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if (f === '--top' && flags[i + 1]) {
+      topN       = parseInt(flags[++i]!, 10) || 10;
+    } else if (f === '--min-count' && flags[i + 1]) {
+      minCount   = parseInt(flags[++i]!, 10) || 1;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  if (!sinceDate) sinceDate = new Date(Date.now() - 24 * 3_600_000);
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read entries ──────────────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  // Per-tool aggregation
+  const toolMap = new Map<string, { denied: number; killed: number; allowed: number; reasons: Map<string, number> }>();
+  // Per-reason aggregation
+  const reasonMap = new Map<string, { denied: number; killed: number; tools: Map<string, number> }>();
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+    if (!entry.ts || new Date(entry.ts) < sinceDate) continue;
+
+    const tool    = entry.tool ?? '(unknown)';
+    const verdict = entry.verdict ?? 'allow';
+    const reason  = entry.reason ?? '';
+
+    if (!toolMap.has(tool)) {
+      toolMap.set(tool, { denied: 0, killed: 0, allowed: 0, reasons: new Map() });
+    }
+    const ts = toolMap.get(tool)!;
+
+    if (verdict === 'deny') {
+      ts.denied++;
+      if (reason) ts.reasons.set(reason, (ts.reasons.get(reason) ?? 0) + 1);
+    } else if (verdict === 'killed') {
+      ts.killed++;
+      if (reason) ts.reasons.set(reason, (ts.reasons.get(reason) ?? 0) + 1);
+    } else {
+      ts.allowed++;
+    }
+
+    if (verdict === 'deny' || verdict === 'killed') {
+      const rkey = reason || '(no reason)';
+      if (!reasonMap.has(rkey)) reasonMap.set(rkey, { denied: 0, killed: 0, tools: new Map() });
+      const rs2 = reasonMap.get(rkey)!;
+      if (verdict === 'deny') rs2.denied++;
+      else rs2.killed++;
+      rs2.tools.set(tool, (rs2.tools.get(tool) ?? 0) + 1);
+    }
+  }
+
+  // ── Build sorted result arrays ─────────────────────────────────────────────
+  const topTools = [...toolMap.entries()]
+    .map(([tool, s]) => ({
+      tool,
+      denied:  s.denied,
+      killed:  s.killed,
+      total:   s.denied + s.killed,
+      allowed: s.allowed,
+      denyRate: s.denied + s.killed + s.allowed > 0
+        ? Math.round((s.denied + s.killed) / (s.denied + s.killed + s.allowed) * 100)
+        : 0,
+      reasons: [...s.reasons.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([r, c]) => ({ reason: r, count: c })),
+    }))
+    .filter(t => t.total >= minCount)
+    .sort((a, b) => b.total - a.total)
+    .slice(0, topN);
+
+  const topReasons = [...reasonMap.entries()]
+    .map(([reason, s]) => ({
+      reason,
+      denied:  s.denied,
+      killed:  s.killed,
+      total:   s.denied + s.killed,
+      tools:   [...s.tools.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([t, c]) => ({ tool: t, count: c })),
+    }))
+    .filter(r => r.total >= minCount)
+    .sort((a, b) => b.total - a.total)
+    .slice(0, topN);
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:     sinceDate.toISOString(),
+      topTools,
+      topReasons,
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  console.log(`\n${pc.bold('warden top-denied')} — most-blocked tools and reasons`);
+  console.log(pc.dim(`  Since ${sinceDate.toISOString()}`));
+  console.log();
+
+  if (topTools.length === 0) {
+    console.log(pc.dim(`  No denied or killed calls found.`));
+    console.log();
+    return;
+  }
+
+  console.log(pc.bold('  Top Denied Tools:'));
+  console.log();
+  const maxTotal = topTools[0]!.total;
+  for (const t of topTools) {
+    const bar = '█'.repeat(Math.ceil(t.total / maxTotal * 16));
+    const topR = t.reasons[0]?.reason ?? '';
+    console.log(
+      `  ${String(t.total).padStart(5)} ${pc.dim(bar.padEnd(16))} ` +
+      `${pc.bold(t.tool)} ${pc.dim(`(${t.denyRate}% blocked)`)}` +
+      (topR ? `  → ${pc.yellow(topR)}` : ''),
+    );
+  }
+
+  console.log();
+  console.log(pc.bold('  Top Denial Reasons:'));
+  console.log();
+  const maxR = topReasons[0]?.total ?? 1;
+  for (const r of topReasons) {
+    const bar = '█'.repeat(Math.ceil(r.total / maxR * 16));
+    const topT = r.tools[0]?.tool ?? '';
+    console.log(
+      `  ${String(r.total).padStart(5)} ${pc.dim(bar.padEnd(16))} ` +
+      `${pc.bold(r.reason)}` +
+      (topT ? `  via ${pc.cyan(topT)}` : ''),
+    );
+  }
+  console.log();
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -6713,6 +6885,10 @@ async function main(): Promise<void> {
 
     case 'chain':
       await cmdChain(argv.slice(1));
+      break;
+
+    case 'top-denied':
+      await cmdTopDenied(argv.slice(1));
       break;
 
     default:
