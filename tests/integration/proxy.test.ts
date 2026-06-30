@@ -645,3 +645,37 @@ describe('Rate limiting', () => {
     }
   });
 });
+
+describe('Built-in warden_status tool', () => {
+  test('14. warden_status returns correct mode and kill-switch state', async () => {
+    const dir     = makeTestDir('test14');
+    const logFile = path.join(dir, 'audit.jsonl');
+    const config  = {
+      ...singleServerConfig(logFile),
+      mode: 'enforce',
+    };
+
+    const { client, cleanup } = await spawnWarden(config);
+    try {
+      const result = await client.callTool({ name: 'warden_status', arguments: {} });
+      const content = (result as { content: Array<{ text: string }> }).content;
+      expect(content).toHaveLength(1);
+
+      const status = JSON.parse(content[0]!.text) as {
+        version: string;
+        mode: string;
+        killSwitch: { active: boolean };
+        servers: string[];
+        policy: { defaultAction: string };
+      };
+
+      expect(status.version).toBe('0.1.0');
+      expect(status.mode).toBe('enforce');
+      expect(status.killSwitch.active).toBe(false);
+      expect(status.servers).toContain('_default');
+      expect(status.policy.defaultAction).toBe('allow');
+    } finally {
+      await cleanup();
+    }
+  });
+});
