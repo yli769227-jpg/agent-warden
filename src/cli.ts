@@ -92,6 +92,7 @@ function printUsage(): void {
       `  ${pc.cyan('replay')}             Re-evaluate audit log entries against current policy`,
       `  ${pc.cyan('ci-check')}           Run all CI safety checks and exit 1 if any fail`,
       `  ${pc.cyan('profile')}            Show tool call distribution and session behaviour profile`,
+      `  ${pc.cyan('summary')}            Generate a plain-English security summary for stakeholders`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -994,6 +995,223 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: summary ─────────────────────────────────────────────────────────
+
+async function cmdSummary(flags: string[]): Promise<void> {
+  // Generates a plain-English security summary of agent activity.
+  // Designed to be readable by non-technical stakeholders (team leads, security teams).
+  //
+  // Output includes:
+  //   - Executive paragraph: what happened, how risky
+  //   - Key metrics table
+  //   - Notable events (denies, kills, dangerous tools)
+  //   - Risk assessment: CLEAN / LOW / MEDIUM / HIGH / CRITICAL
+  //
+  // Flags:
+  //   --since/-s <expr>   Only summarise entries since this date (default: last 24h)
+  //   --title/-t <str>    Custom title for the report
+  //   --output/-o <file>  Save report to file (default: stdout only)
+  //   --json/-j           Machine-readable output (structured data)
+
+  let sinceDate: Date  = new Date(Date.now() - 24 * 3_600_000); // last 24h
+  let title:     string = 'Agent Security Summary';
+  let outputPath: string | undefined;
+  let jsonOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate = parseSince(flags[++i]!)!;
+    } else if ((f === '--title' || f === '-t') && flags[i + 1]) {
+      title = flags[++i]!;
+    } else if ((f === '--output' || f === '-o') && flags[i + 1]) {
+      outputPath = flags[++i];
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Aggregate ──────────────────────────────────────────────────────────────
+  const DANGEROUS = /delete|remove|bash|shell|exec|sudo|kill|rm|drop|truncate|format/i;
+
+  let total          = 0;
+  let allowed        = 0;
+  let denied         = 0;
+  let killed         = 0;
+  let dangerousCalls = 0;
+  let firstTs:       string | undefined;
+  let lastTs:        string | undefined;
+  const toolCounts:  Record<string, number> = {};
+  const deniedTools: Set<string>   = new Set();
+  const killedTools: Set<string>   = new Set();
+  const dangerousOnes: Set<string> = new Set();
+  const durations:   number[] = [];
+
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    total++;
+    if (entry.verdict === 'allow')  allowed++;
+    if (entry.verdict === 'deny')   denied++;
+    if (entry.verdict === 'killed') killed++;
+
+    const tool = entry.tool ?? '(unknown)';
+    toolCounts[tool] = (toolCounts[tool] ?? 0) + 1;
+
+    if (entry.verdict === 'deny')   deniedTools.add(tool);
+    if (entry.verdict === 'killed') killedTools.add(tool);
+    if (DANGEROUS.test(tool)) { dangerousCalls++; dangerousOnes.add(tool); }
+
+    if (!firstTs || (entry.ts && entry.ts < firstTs)) firstTs = entry.ts;
+    if (!lastTs  || (entry.ts && entry.ts > lastTs))  lastTs   = entry.ts;
+    if (typeof entry.durationMs === 'number') durations.push(entry.durationMs);
+  }
+
+  const denyRate   = total > 0 ? parseFloat((denied / total * 100).toFixed(1)) : 0;
+  const killRate   = total > 0 ? parseFloat((killed / total * 100).toFixed(1)) : 0;
+  const avgMs      = durations.length > 0
+    ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length)
+    : null;
+  const uniqueTools = Object.keys(toolCounts).length;
+  const topTool    = Object.entries(toolCounts).sort((a, b) => b[1] - a[1])[0];
+
+  // ── Risk grade ─────────────────────────────────────────────────────────────
+  const riskScore = Math.min(100, Math.round(
+    denyRate * 0.40 +
+    Math.min(100, dangerousCalls / Math.max(total, 1) * 100 * 1.5) * 0.30 +
+    (killed > 0 ? 40 : 0) * 0.30,
+  ));
+  const grade =
+    riskScore >= 80 ? 'CRITICAL' :
+    riskScore >= 60 ? 'HIGH'     :
+    riskScore >= 40 ? 'MEDIUM'   :
+    riskScore >= 20 ? 'LOW'      :
+                      'CLEAN';
+
+  // ── Generate executive paragraph ───────────────────────────────────────────
+  const periodStr = firstTs && lastTs
+    ? `from ${firstTs.slice(0, 16).replace('T', ' ')} to ${lastTs.slice(0, 16).replace('T', ' ')} UTC`
+    : 'in the specified period';
+
+  let execPara: string;
+  if (total === 0) {
+    execPara = 'No agent activity was recorded in the specified time window.';
+  } else if (grade === 'CLEAN') {
+    execPara = `The agent operated normally ${periodStr}, making ${total} tool call${total > 1 ? 's' : ''} with no security concerns. All requests were approved and no unusual patterns were detected.`;
+  } else if (grade === 'LOW') {
+    execPara = `The agent was generally well-behaved ${periodStr} with ${total} tool calls. A small number of requests (${denied} denied, ${killRate}% killed) were blocked, which is within acceptable limits.`;
+  } else if (grade === 'MEDIUM') {
+    execPara = `The agent showed moderate security signals ${periodStr}. Out of ${total} tool calls, ${denied} were denied (${denyRate}% deny rate)${killedTools.size > 0 ? ` and the kill switch was activated for ${killedTools.size} tool(s)` : ''}. Security review is recommended.`;
+  } else if (grade === 'HIGH') {
+    execPara = `The agent raised significant security concerns ${periodStr}. ${denyRate}% of ${total} tool calls were blocked${dangerousOnes.size > 0 ? `, including calls to ${dangerousOnes.size} potentially dangerous tool(s)` : ''}. Immediate review is recommended.`;
+  } else {
+    execPara = `CRITICAL: The agent exhibited highly anomalous behaviour ${periodStr}. ${denyRate}% deny rate, ${killed} kill-switch event(s), and ${dangerousCalls} dangerous tool call(s) detected. Escalation required.`;
+  }
+
+  // ── Notable events ─────────────────────────────────────────────────────────
+  const notableEvents: string[] = [];
+  if (deniedTools.size > 0) {
+    notableEvents.push(`Tools denied: ${[...deniedTools].slice(0, 5).join(', ')}${deniedTools.size > 5 ? ` and ${deniedTools.size - 5} more` : ''}`);
+  }
+  if (killedTools.size > 0) {
+    notableEvents.push(`Kill switch triggered for: ${[...killedTools].slice(0, 3).join(', ')}`);
+  }
+  if (dangerousOnes.size > 0) {
+    notableEvents.push(`Dangerous tools called: ${[...dangerousOnes].slice(0, 3).join(', ')}`);
+  }
+  if (topTool && topTool[1] > total * 0.5) {
+    notableEvents.push(`Dominant tool: ${topTool[0]} (${topTool[1]}/${total} calls = ${(topTool[1]/total*100).toFixed(0)}%)`);
+  }
+
+  // ── Output ─────────────────────────────────────────────────────────────────
+  const data = {
+    title,
+    generatedAt: new Date().toISOString(),
+    period: { since: sinceDate.toISOString(), first: firstTs ?? null, last: lastTs ?? null },
+    grade,
+    riskScore,
+    metrics: {
+      total, allowed, denied, killed,
+      denyRate, killRate,
+      uniqueTools,
+      dangerousCalls,
+      avgMs,
+      topTool: topTool ? { tool: topTool[0], calls: topTool[1] } : null,
+    },
+    executiveSummary: execPara,
+    notableEvents,
+  };
+
+  if (jsonOutput) {
+    const out = JSON.stringify(data, null, 2);
+    console.log(out);
+    if (outputPath) fs.writeFileSync(outputPath, out + '\n', 'utf8');
+    return;
+  }
+
+  // Plain-text report
+  const sep = '─'.repeat(60);
+  const lines: string[] = [
+    `\n${pc.bold(title)}`,
+    pc.dim(`Generated: ${new Date().toLocaleString()}`),
+    pc.dim(`Period   : ${sinceDate.toLocaleString()} →`),
+    '',
+    pc.dim(sep),
+    '',
+    execPara,
+    '',
+    pc.dim(sep),
+    '',
+    pc.bold('Key Metrics:'),
+    `  Total calls   : ${total}`,
+    `  Allowed       : ${allowed}  (${total > 0 ? (100 - denyRate - killRate).toFixed(1) : '0'}%)`,
+    `  Denied        : ${denied}   (${denyRate}%)`,
+    `  Kill-switch   : ${killed}   (${killRate}%)`,
+    `  Unique tools  : ${uniqueTools}`,
+    ...(avgMs != null ? [`  Avg latency   : ${avgMs}ms`] : []),
+    '',
+  ];
+
+  if (notableEvents.length > 0) {
+    lines.push(pc.bold('Notable Events:'));
+    for (const e of notableEvents) lines.push(`  • ${e}`);
+    lines.push('');
+  }
+
+  const gradeColor =
+    grade === 'CRITICAL' ? pc.bgRed(pc.white(` ${grade} `)) :
+    grade === 'HIGH'     ? pc.red(`[${grade}]`)    :
+    grade === 'MEDIUM'   ? pc.yellow(`[${grade}]`) :
+    grade === 'LOW'      ? pc.blue(`[${grade}]`)   :
+                           pc.green(`[${grade}]`);
+
+  lines.push(`${pc.bold('Risk Assessment:')} ${gradeColor}`);
+  lines.push('');
+
+  const report = lines.join('\n');
+  console.log(report);
+
+  if (outputPath) {
+    const plainReport = report.replace(/\x1b\[[0-9;]*m/g, '');
+    fs.writeFileSync(outputPath, plainReport + '\n', 'utf8');
+    console.log(pc.dim(`Report saved → ${outputPath}`));
   }
 }
 
@@ -4398,6 +4616,10 @@ async function main(): Promise<void> {
 
     case 'profile':
       await cmdProfile(argv.slice(1));
+      break;
+
+    case 'summary':
+      await cmdSummary(argv.slice(1));
       break;
 
     default:
