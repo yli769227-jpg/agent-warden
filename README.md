@@ -194,6 +194,9 @@ scrubber:
 | `warden top` | Live dashboard — top-N tools by call count, refreshed every interval |
 | `warden watch` | Smart real-time watcher — alerts on bursts, cascading denies, kill events |
 | `warden profile` | Tool call distribution and session behavioural fingerprint (`--since`, `--json`) |
+| `warden heat-map` | Hour × weekday density heat map — spot anomalous time patterns (`--since`, `--tool`, `--json`) |
+| `warden blame` | Find activity spikes and attribute them to responsible tools (`--window`, `--bucket-mins`, `--json`) |
+| `warden scope` | Map which files, URLs, and repos the agent touched (`--since`, `--window`, `--tool`, `--json`) |
 
 ### Intelligence
 
@@ -203,6 +206,7 @@ scrubber:
 | `warden suggest` | Analyse audit log and suggest policy rules (`--since`, `--yaml`, `--json`) |
 | `warden report` | Generate a Markdown audit summary (`--output`, `--since`, `--title`) |
 | `warden summary` | Plain-English security summary for stakeholders (`--since`, `--title`, `--output`, `--json`) |
+| `warden export-html` | Generate a self-contained interactive HTML report (`--output`, `--title`, `--since`, `--open`) |
 
 ### CI/CD
 
