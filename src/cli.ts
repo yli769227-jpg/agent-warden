@@ -82,6 +82,7 @@ function printUsage(): void {
       `  ${pc.cyan('alert-test')}        Send a test webhook to all configured targets and report results`,
       `  ${pc.cyan('config-gen')}        Scan Claude Desktop / Claude Code config and generate warden.config.yaml`,
       `  ${pc.cyan('server-list')}        Connect to all configured servers and list available tools`,
+      `  ${pc.cyan('timeline')}           ASCII timeline of tool calls grouped by time bucket`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -943,6 +944,180 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: timeline ────────────────────────────────────────────────────────
+
+async function cmdTimeline(flags: string[]): Promise<void> {
+  // ASCII timeline of tool call activity grouped into time buckets.
+  // Flags:
+  //   --since/-s <expr>     Only include entries after this point (default: 1h)
+  //   --bucket <mins>       Bucket size in minutes (default: auto from range)
+  //   --width <cols>        Width of bar chart (default: 60)
+  //   --tool/-t <pattern>   Filter to specific tool pattern
+  //   --split-verdict       Show allow/deny breakdown per bucket
+
+  let sinceDate: Date | undefined;
+  let bucketMins: number | undefined;
+  let barWidth       = 60;
+  let toolFilter: string | undefined;
+  let splitVerdict   = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate = parseSince(flags[++i]!);
+    } else if (f === '--bucket' && flags[i + 1]) {
+      bucketMins = parseInt(flags[++i]!, 10);
+    } else if (f === '--width' && flags[i + 1]) {
+      barWidth = parseInt(flags[++i]!, 10);
+    } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
+      toolFilter = flags[++i];
+    } else if (f === '--split-verdict') {
+      splitVerdict = true;
+    }
+  }
+
+  // Default: last 1 hour
+  if (!sinceDate) sinceDate = parseSince('1h');
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read and bucket entries ────────────────────────────────────────────────
+  let firstTs: Date | undefined;
+  let lastTs:  Date | undefined;
+
+  const raw: Array<{ ts: Date; tool: string; verdict: string }> = [];
+
+  const readStream = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl         = readline.createInterface({ input: readStream, crlfDelay: Infinity });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+    if (!entry.ts) continue;
+
+    const ts = new Date(entry.ts);
+    if (ts < sinceDate) continue;
+
+    if (toolFilter) {
+      const pattern = toolFilter.includes('*')
+        ? new RegExp('^' + toolFilter.split('*').map(s => s.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('.*') + '$')
+        : null;
+      const match = pattern ? pattern.test(entry.tool ?? '') : (entry.tool ?? '').includes(toolFilter);
+      if (!match) continue;
+    }
+
+    raw.push({ ts, tool: entry.tool ?? 'unknown', verdict: entry.verdict ?? 'unknown' });
+
+    if (!firstTs || ts < firstTs) firstTs = ts;
+    if (!lastTs  || ts > lastTs)  lastTs   = ts;
+  }
+
+  if (raw.length === 0) {
+    console.log(pc.yellow('No entries found in the specified time range'));
+    return;
+  }
+
+  const rangeMs = (lastTs!.getTime() - firstTs!.getTime()) || 60_000;
+
+  // Auto-select bucket size if not specified
+  if (!bucketMins) {
+    if (rangeMs <= 5 * 60_000)       bucketMins = 1;
+    else if (rangeMs <= 30 * 60_000)  bucketMins = 5;
+    else if (rangeMs <= 2 * 3600_000) bucketMins = 15;
+    else if (rangeMs <= 12 * 3600_000) bucketMins = 60;
+    else                               bucketMins = 360;
+  }
+
+  const bucketMs = bucketMins * 60_000;
+
+  // Build buckets: epoch bucket index → { allow, deny, killed }
+  const buckets: Map<number, { allow: number; deny: number; killed: number }> = new Map();
+
+  for (const r of raw) {
+    const key = Math.floor(r.ts.getTime() / bucketMs);
+    const b   = buckets.get(key) ?? { allow: 0, deny: 0, killed: 0 };
+    if (r.verdict === 'allow')  b.allow++;
+    if (r.verdict === 'deny')   b.deny++;
+    if (r.verdict === 'killed') b.killed++;
+    buckets.set(key, b);
+  }
+
+  // Fill in empty buckets for continuity
+  const minKey = Math.floor(firstTs!.getTime() / bucketMs);
+  const maxKey = Math.floor(lastTs!.getTime()  / bucketMs);
+  for (let k = minKey; k <= maxKey; k++) {
+    if (!buckets.has(k)) buckets.set(k, { allow: 0, deny: 0, killed: 0 });
+  }
+
+  const sortedKeys = [...buckets.keys()].sort((a, b) => a - b);
+
+  const maxTotal = Math.max(...sortedKeys.map(k => {
+    const b = buckets.get(k)!;
+    return b.allow + b.deny + b.killed;
+  }));
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  const toolLabel = toolFilter ? ` · tool: ${toolFilter}` : '';
+  const bucketLabel = bucketMins >= 60 ? `${bucketMins / 60}h` : `${bucketMins}m`;
+  console.log(`${pc.bold('Timeline')}${toolLabel} · bucket: ${bucketLabel} · ${raw.length} calls`);
+  console.log(pc.dim(`  ${firstTs!.toISOString()} → ${lastTs!.toISOString()}`));
+  console.log();
+
+  const labelWidth = 6; // "HH:MM " or "Www "
+
+  for (const key of sortedKeys) {
+    const b     = buckets.get(key)!;
+    const total = b.allow + b.deny + b.killed;
+    const time  = new Date(key * bucketMs);
+
+    // Format time label
+    const timeStr = bucketMins >= 1440
+      ? `${time.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`
+      : `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
+
+    const label = timeStr.padEnd(labelWidth);
+    const count = String(total).padStart(4);
+
+    if (maxTotal === 0 || total === 0) {
+      console.log(`${pc.dim(label)} ${count} ${pc.dim('·')}`);
+      continue;
+    }
+
+    const filled = Math.round((total / maxTotal) * barWidth);
+
+    let bar: string;
+    if (splitVerdict) {
+      const aFilled = Math.round((b.allow  / total) * filled);
+      const dFilled = Math.round((b.deny   / total) * filled);
+      const kFilled = filled - aFilled - dFilled;
+      bar  = pc.green('█'.repeat(aFilled));
+      bar += pc.red(   '█'.repeat(dFilled));
+      bar += pc.bgRed(pc.white('█'.repeat(Math.max(0, kFilled))));
+    } else {
+      bar = (b.deny + b.killed > 0 ? pc.red : pc.green)('█'.repeat(filled));
+    }
+
+    const denyNote = (b.deny + b.killed > 0 && !splitVerdict)
+      ? pc.red(` (${b.deny + b.killed} blocked)`)
+      : '';
+
+    console.log(`${pc.dim(label)} ${count} ${bar}${denyNote}`);
+  }
+
+  console.log();
+  if (splitVerdict) {
+    console.log(pc.dim(`  ${pc.green('█')} allow   ${pc.red('█')} deny   ${pc.bgRed(pc.white('█'))} killed`));
+  } else {
+    console.log(pc.dim(`  ${pc.green('█')} calls with all-allow   ${pc.red('█')} calls with any block`));
   }
 }
 
@@ -2672,6 +2847,10 @@ async function main(): Promise<void> {
     case 'server-list':
     case 'list-tools':
       await cmdServerList(argv.slice(1));
+      break;
+
+    case 'timeline':
+      await cmdTimeline(argv.slice(1));
       break;
 
     default:
