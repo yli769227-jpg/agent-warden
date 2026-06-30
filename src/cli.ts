@@ -3079,6 +3079,178 @@ async function cmdTopDenied(flags: string[]): Promise<void> {
   console.log();
 }
 
+// ─── Command: tool-graph ──────────────────────────────────────────────────────
+
+async function cmdToolGraph(flags: string[]): Promise<void> {
+  // Renders tool co-occurrence / sequential relationships as a DOT digraph.
+  // Each edge A → B means "A was immediately followed by B" in the log.
+  // Edge weight = co-occurrence count. Node color = deny rate.
+  //
+  // Output modes:
+  //   default: DOT format (suitable for: dot -Tpng -o graph.png)
+  //   --json:  adjacency list { nodes, edges }
+  //
+  // Flags:
+  //   --since/-s <expr>   Start of window (default: last 24h)
+  //   --min-weight <N>    Only include edges with count >= N (default: 1)
+  //   --gap-mins <G>      Max gap between consecutive calls to form an edge (default: 30)
+  //   --top <N>           Only include the top N most-called nodes (default: 30)
+  //   --output/-o <file>  Write DOT to file instead of stdout
+  //   --json/-j           Output adjacency JSON instead of DOT
+
+  let sinceDate: Date | undefined;
+  let minWeight  = 1;
+  let gapMins    = 30;
+  let topN       = 30;
+  let outputFile = '';
+  let jsonOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if (f === '--min-weight' && flags[i + 1]) {
+      minWeight  = parseInt(flags[++i]!, 10) || 1;
+    } else if (f === '--gap-mins' && flags[i + 1]) {
+      gapMins    = parseInt(flags[++i]!, 10) || 30;
+    } else if (f === '--top' && flags[i + 1]) {
+      topN       = parseInt(flags[++i]!, 10) || 30;
+    } else if ((f === '--output' || f === '-o') && flags[i + 1]) {
+      outputFile = flags[++i]!;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  if (!sinceDate) sinceDate = new Date(Date.now() - 24 * 3_600_000);
+  const gapMs = gapMins * 60_000;
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read and sort entries ──────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  type RawEntry = { tool: string; tsMs: number; denied: boolean };
+  const allEntries: RawEntry[] = [];
+
+  // Also track per-node stats
+  const nodeStats = new Map<string, { calls: number; denied: number }>();
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+    if (!entry.ts) continue;
+    const tsMs = new Date(entry.ts).getTime();
+    if (tsMs < sinceDate.getTime()) continue;
+
+    const tool   = entry.tool ?? '(unknown)';
+    const denied = entry.verdict === 'deny' || entry.verdict === 'killed';
+
+    allEntries.push({ tool, tsMs, denied });
+    if (!nodeStats.has(tool)) nodeStats.set(tool, { calls: 0, denied: 0 });
+    const ns = nodeStats.get(tool)!;
+    ns.calls++;
+    if (denied) ns.denied++;
+  }
+
+  allEntries.sort((a, b) => a.tsMs - b.tsMs);
+
+  // ── Build edge map ─────────────────────────────────────────────────────────
+  const edgeMap = new Map<string, number>();
+
+  for (let i = 0; i < allEntries.length - 1; i++) {
+    const a = allEntries[i]!;
+    const b = allEntries[i + 1]!;
+    if (b.tsMs - a.tsMs > gapMs) continue;
+    const key = `${a.tool}\x00${b.tool}`;
+    edgeMap.set(key, (edgeMap.get(key) ?? 0) + 1);
+  }
+
+  // ── Pick top-N nodes by call count ─────────────────────────────────────────
+  const topNodes = new Set(
+    [...nodeStats.entries()]
+      .sort((a, b) => b[1].calls - a[1].calls)
+      .slice(0, topN)
+      .map(([t]) => t),
+  );
+
+  const edges = [...edgeMap.entries()]
+    .map(([key, count]) => {
+      const [from, to] = key.split('\x00') as [string, string];
+      return { from, to, count };
+    })
+    .filter(e => e.count >= minWeight && topNodes.has(e.from) && topNodes.has(e.to));
+
+  const nodes = [...topNodes]
+    .map(tool => {
+      const s = nodeStats.get(tool) ?? { calls: 0, denied: 0 };
+      return {
+        tool,
+        calls:    s.calls,
+        denied:   s.denied,
+        denyRate: s.calls > 0 ? Math.round(s.denied / s.calls * 100) : 0,
+      };
+    })
+    .sort((a, b) => b.calls - a.calls);
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({ since: sinceDate.toISOString(), nodes, edges }, null, 2));
+    return;
+  }
+
+  // ── Generate DOT format ───────────────────────────────────────────────────
+  function nodeId(tool: string): string {
+    return `"${tool.replace(/"/g, '\\"')}"`;
+  }
+
+  function denyColor(rate: number): string {
+    if (rate === 0)   return '#d4edda';  // green-tinted
+    if (rate < 25)    return '#fff3cd';  // yellow-tinted
+    if (rate < 50)    return '#ffe5b4';  // orange-tinted
+    if (rate < 75)    return '#f8d7da';  // red-tinted
+    return '#c0392b';                    // deep red
+  }
+
+  const maxCount = edges.reduce((m, e) => Math.max(m, e.count), 1);
+
+  const dot = [
+    'digraph agent_tool_graph {',
+    '  graph [fontname="Helvetica" rankdir=LR];',
+    '  node  [fontname="Helvetica" shape=box style=filled fontsize=10];',
+    '  edge  [fontname="Helvetica" fontsize=9];',
+    '',
+    '  // Nodes',
+    ...nodes.map(n => {
+      const color = denyColor(n.denyRate);
+      const label = `${n.tool}\\n${n.calls} calls (${n.denyRate}% blocked)`;
+      return `  ${nodeId(n.tool)} [label="${label}" fillcolor="${color}" fontcolor="#000000"];`;
+    }),
+    '',
+    '  // Edges',
+    ...edges.map(e => {
+      const w = Math.max(1, Math.round(e.count / maxCount * 5));
+      return `  ${nodeId(e.from)} -> ${nodeId(e.to)} [label="${e.count}" penwidth=${w}];`;
+    }),
+    '}',
+    '',
+  ].join('\n');
+
+  if (outputFile) {
+    fs.writeFileSync(outputFile, dot, 'utf8');
+    console.log(pc.green(`✓ DOT graph written to ${outputFile}`));
+    console.log(pc.dim(`  Render: dot -Tpng "${outputFile}" -o graph.png`));
+  } else {
+    process.stdout.write(dot);
+  }
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -6889,6 +7061,10 @@ async function main(): Promise<void> {
 
     case 'top-denied':
       await cmdTopDenied(argv.slice(1));
+      break;
+
+    case 'tool-graph':
+      await cmdToolGraph(argv.slice(1));
       break;
 
     default:
