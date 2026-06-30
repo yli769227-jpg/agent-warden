@@ -1813,6 +1813,167 @@ async function cmdSessionSummary(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: alert-history ───────────────────────────────────────────────────
+
+async function cmdAlertHistory(flags: string[]): Promise<void> {
+  // Shows all security incidents (deny + killed verdicts) from the audit log.
+  // Useful for reviewing "what triggered alerts?" without having to grep.
+  //
+  // Groups consecutive deny/kill events within a configurable burst window,
+  // so a rapid cascade of denies appears as a single incident entry.
+  //
+  // Flags:
+  //   --since/-s <expr>    Start of window (default: all)
+  //   --verdict <v>        Filter: deny | killed | all (default: all)
+  //   --burst-secs <N>     Group events within N seconds (default 60)
+  //   --limit <N>          Max incidents to show (default 50)
+  //   --json/-j            Machine-readable output
+  //   --reverse/-r         Show oldest first (default: newest first)
+
+  let sinceDate: Date | undefined;
+  let verdictFilter: string | undefined;
+  let burstSecs   = 60;
+  let limit       = 50;
+  let jsonOutput  = false;
+  let newestFirst = true;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate     = parseSince(flags[++i]!);
+    } else if (f === '--verdict' && flags[i + 1]) {
+      verdictFilter = flags[++i];
+    } else if (f === '--burst-secs' && flags[i + 1]) {
+      burstSecs     = parseInt(flags[++i]!, 10) || 60;
+    } else if (f === '--limit' && flags[i + 1]) {
+      limit         = parseInt(flags[++i]!, 10) || 50;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput    = true;
+    } else if (f === '--reverse' || f === '-r') {
+      newestFirst   = false;
+    }
+  }
+
+  const burstMs = burstSecs * 1000;
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Collect alert entries ──────────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  const alertEntries: AuditEntry[] = [];
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (sinceDate && entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    const v = entry.verdict;
+    if (v !== 'deny' && v !== 'killed') continue;
+
+    if (verdictFilter && verdictFilter !== 'all' && v !== verdictFilter) continue;
+
+    alertEntries.push(entry);
+  }
+
+  // Sort oldest first for clustering
+  alertEntries.sort((a, b) => {
+    const ta = a.ts ? new Date(a.ts).getTime() : 0;
+    const tb = b.ts ? new Date(b.ts).getTime() : 0;
+    return ta - tb;
+  });
+
+  // ── Cluster into incidents ─────────────────────────────────────────────────
+  type Incident = {
+    id:        number;
+    firstAt:   string;
+    lastAt:    string;
+    count:     number;
+    denied:    number;
+    killed:    number;
+    tools:     string[];
+    reasons:   string[];
+  };
+
+  const incidents: Incident[] = [];
+  let   incidentId = 0;
+  let   lastAlertTs = 0;
+  let   current: AuditEntry[] = [];
+
+  function flushIncident(): void {
+    if (current.length === 0) return;
+    const denied  = current.filter(e => e.verdict === 'deny').length;
+    const killed  = current.filter(e => e.verdict === 'killed').length;
+    const tools   = [...new Set(current.map(e => e.tool ?? '(unknown)'))].sort();
+    const reasons = [...new Set(current.map(e => e.reason).filter((r): r is string => Boolean(r)))];
+    incidents.push({
+      id:      ++incidentId,
+      firstAt: current[0]!.ts ?? '',
+      lastAt:  current[current.length - 1]!.ts ?? '',
+      count:   current.length,
+      denied, killed, tools, reasons,
+    });
+    current = [];
+  }
+
+  for (const entry of alertEntries) {
+    const ts = entry.ts ? new Date(entry.ts).getTime() : 0;
+    if (lastAlertTs > 0 && ts - lastAlertTs > burstMs) {
+      flushIncident();
+    }
+    current.push(entry);
+    lastAlertTs = ts;
+  }
+  flushIncident();
+
+  let display = [...incidents];
+  if (newestFirst) display.reverse();
+  display = display.slice(0, limit);
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      since:          sinceDate?.toISOString(),
+      verdictFilter:  verdictFilter ?? 'all',
+      burstSecs,
+      totalIncidents: incidents.length,
+      incidents:      display,
+    }, null, 2));
+    return;
+  }
+
+  // ── Text output ─────────────────────────────────────────────────────────────
+  console.log(`\n${pc.bold('warden alert-history')} — ${display.length} of ${incidents.length} incidents`);
+  if (sinceDate) console.log(pc.dim(`  Since ${sinceDate.toISOString()}`));
+  console.log();
+
+  if (display.length === 0) {
+    console.log(pc.dim('  No deny or kill events in this window. ✓'));
+    console.log();
+    return;
+  }
+
+  for (const inc of display) {
+    const killBadge  = inc.killed > 0 ? pc.red(` [KILL×${inc.killed}]`) : '';
+    const denyBadge  = inc.denied > 0 ? pc.yellow(` [DENY×${inc.denied}]`) : '';
+    const timeStr    = inc.firstAt.slice(0, 19).replace('T', ' ');
+    const burst      = inc.count > 1 ? pc.dim(` (${inc.count} events)`) : '';
+    console.log(`  ${pc.bold(timeStr)}${killBadge}${denyBadge}${burst}`);
+    console.log(`    tools:  ${inc.tools.join(', ')}`);
+    if (inc.reasons.length > 0) {
+      console.log(`    reason: ${inc.reasons.join('; ')}`);
+    }
+    console.log();
+  }
+}
+
 // ─── Command: heat-map ────────────────────────────────────────────────────────
 
 async function cmdHeatMap(flags: string[]): Promise<void> {
@@ -5586,6 +5747,10 @@ async function main(): Promise<void> {
 
     case 'session-summary':
       await cmdSessionSummary(argv.slice(1));
+      break;
+
+    case 'alert-history':
+      await cmdAlertHistory(argv.slice(1));
       break;
 
     default:
