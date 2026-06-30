@@ -86,6 +86,7 @@ function printUsage(): void {
       `  ${pc.cyan('doctor')}             Full health check of warden installation and config`,
       `  ${pc.cyan('suggest')}            Analyse audit log and suggest policy rules`,
       `  ${pc.cyan('snapshot')}           Save a timestamped JSON snapshot of current audit stats`,
+      `  ${pc.cyan('compare')}            Compare two snapshot files and show regressions`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -988,6 +989,173 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: compare ─────────────────────────────────────────────────────────
+
+async function cmdCompare(flags: string[]): Promise<void> {
+  // Compare two snapshot JSON files (produced by warden snapshot).
+  // Reports regressions: deny rate increase, new blocked tools, etc.
+  //
+  // Usage: warden compare <baseline.json> <current.json> [--json] [--fail-on-regression]
+
+  let baselinePath: string | undefined;
+  let currentPath:  string | undefined;
+  let jsonOutput    = false;
+  let failOnRegress = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if (f === '--fail-on-regression' || f === '-f') {
+      failOnRegress = true;
+    } else if (!f.startsWith('-')) {
+      if (!baselinePath) baselinePath = f;
+      else if (!currentPath) currentPath = f;
+    }
+  }
+
+  if (!baselinePath || !currentPath) {
+    console.error(pc.red('Usage: warden compare <baseline.json> <current.json> [--json] [--fail-on-regression]'));
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(baselinePath)) {
+    console.error(pc.red(`Baseline snapshot not found: ${baselinePath}`));
+    process.exit(1);
+  }
+  if (!fs.existsSync(currentPath)) {
+    console.error(pc.red(`Current snapshot not found: ${currentPath}`));
+    process.exit(1);
+  }
+
+  // ── Load snapshots ─────────────────────────────────────────────────────────
+  type SnapshotDoc = {
+    version:  number;
+    snapshotAt: string;
+    tag?:    string;
+    totals:  { calls: number; allow: number; deny: number; killed: number; denyRate: number };
+    latency: { avgMs: number | null; p95Ms: number | null };
+    topTools: Array<{ tool: string; total: number; allow: number; deny: number; killed: number }>;
+  };
+
+  let baseline: SnapshotDoc;
+  let current:  SnapshotDoc;
+
+  try {
+    baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf8')) as SnapshotDoc;
+    current  = JSON.parse(fs.readFileSync(currentPath,  'utf8')) as SnapshotDoc;
+  } catch (err) {
+    console.error(pc.red(`Failed to parse snapshot: ${(err as Error).message}`));
+    process.exit(1);
+  }
+
+  // ── Compute deltas ─────────────────────────────────────────────────────────
+  const denyRateDelta  = current.totals.denyRate - baseline.totals.denyRate;
+  const callsDelta     = current.totals.calls    - baseline.totals.calls;
+  const avgMsDelta     = current.latency.avgMs != null && baseline.latency.avgMs != null
+    ? current.latency.avgMs - baseline.latency.avgMs
+    : null;
+
+  // Tools that are now blocked but weren't in baseline
+  const baselineToolMap = new Map(baseline.topTools.map(t => [t.tool, t]));
+  const currentToolMap  = new Map(current.topTools.map(t => [t.tool, t]));
+
+  const newlyBlocked: string[] = [];
+  const increaseBlocked: Array<{ tool: string; baseline: number; current: number }> = [];
+  const newlyAllowed: string[] = [];
+
+  for (const [tool, ct] of currentToolMap.entries()) {
+    const bt = baselineToolMap.get(tool);
+    const cBlocked = ct.deny + ct.killed;
+    const bBlocked = bt ? bt.deny + bt.killed : 0;
+
+    if (cBlocked > 0 && bBlocked === 0) {
+      newlyBlocked.push(tool);
+    } else if (cBlocked > bBlocked && bt) {
+      increaseBlocked.push({ tool, baseline: bBlocked, current: cBlocked });
+    }
+  }
+
+  for (const [tool, bt] of baselineToolMap.entries()) {
+    const ct = currentToolMap.get(tool);
+    const bBlocked = bt.deny + bt.killed;
+    const cBlocked = ct ? ct.deny + ct.killed : 0;
+    if (bBlocked > 0 && cBlocked === 0) {
+      newlyAllowed.push(tool);
+    }
+  }
+
+  const hasRegression =
+    denyRateDelta > 1 ||          // deny rate increased by more than 1pp
+    newlyBlocked.length > 0 ||
+    increaseBlocked.length > 0;
+
+  // ── Output ─────────────────────────────────────────────────────────────────
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      baseline: { path: baselinePath, tag: baseline.tag, snapshotAt: baseline.snapshotAt },
+      current:  { path: currentPath,  tag: current.tag,  snapshotAt: current.snapshotAt },
+      deltas: {
+        calls:      callsDelta,
+        denyRate:   parseFloat(denyRateDelta.toFixed(2)),
+        avgMs:      avgMsDelta,
+      },
+      regressions: {
+        denyRateIncreased: denyRateDelta > 1,
+        newlyBlocked,
+        increaseBlocked,
+        newlyAllowed,
+      },
+      hasRegression,
+    }, null, 2));
+  } else {
+    const baseLabel = baseline.tag ?? path.basename(baselinePath);
+    const currLabel = current.tag  ?? path.basename(currentPath);
+
+    console.log(`\n${pc.bold('warden compare')}`);
+    console.log(`  Baseline : ${pc.dim(baseLabel)}`);
+    console.log(`  Current  : ${pc.dim(currLabel)}`);
+    console.log();
+
+    const fmtDelta = (d: number, unit = ''): string => {
+      if (d === 0) return pc.dim(`±0${unit}`);
+      return d > 0 ? pc.red(`+${d}${unit}`) : pc.green(`${d}${unit}`);
+    };
+
+    console.log(`  Calls       ${current.totals.calls}  ${fmtDelta(callsDelta)}`);
+    console.log(`  Deny rate   ${current.totals.denyRate}%  ${fmtDelta(parseFloat(denyRateDelta.toFixed(1)), 'pp')}`);
+    if (avgMsDelta != null) {
+      console.log(`  Avg latency ${current.latency.avgMs}ms  ${fmtDelta(Math.round(avgMsDelta), 'ms')}`);
+    }
+
+    if (newlyBlocked.length > 0) {
+      console.log(`\n  ${pc.red('New blocked tools:')}`);
+      for (const t of newlyBlocked) console.log(`    ${pc.red('+')} ${t}`);
+    }
+    if (increaseBlocked.length > 0) {
+      console.log(`\n  ${pc.yellow('Increased blocks:')}`);
+      for (const t of increaseBlocked) {
+        console.log(`    ${pc.yellow('↑')} ${t.tool}  ${t.baseline} → ${t.current}`);
+      }
+    }
+    if (newlyAllowed.length > 0) {
+      console.log(`\n  ${pc.green('Previously blocked, now allowed:')}`);
+      for (const t of newlyAllowed) console.log(`    ${pc.green('-')} ${t}`);
+    }
+
+    console.log();
+    if (hasRegression) {
+      console.log(pc.red('❌ Regression detected'));
+    } else {
+      console.log(pc.green('✅ No regressions'));
+    }
+  }
+
+  if (failOnRegress && hasRegression) {
+    process.exit(1);
   }
 }
 
@@ -3404,6 +3572,10 @@ async function main(): Promise<void> {
 
     case 'snapshot':
       await cmdSnapshot(argv.slice(1));
+      break;
+
+    case 'compare':
+      await cmdCompare(argv.slice(1));
       break;
 
     default:
