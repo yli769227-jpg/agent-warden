@@ -22,6 +22,7 @@ import pc from 'picocolors';
 import { loadConfig } from './config.js';
 import { runProxy } from './proxy.js';
 import { KillSwitch } from './killswitch.js';
+import { WatchAnalyzer } from './watch-analyzer.js';
 import type { AuditEntry } from './types.js';
 
 // ─── Version (read once from package.json at module load) ─────────────────────
@@ -963,16 +964,7 @@ async function cmdWatch(flags: string[]): Promise<void> {
     console.error(pc.yellow(`Waiting for log file: ${logFile}`));
   }
 
-  // State for anomaly detection
-  // burstBuckets: tool → array of timestamps (calls within the window)
-  const burstBuckets: Map<string, number[]> = new Map();
-  // denyStreaks: tool → consecutive deny count
-  const denyStreaks: Map<string, number>    = new Map();
-  // alerted: track what we already alerted to avoid spam
-  const alertedBurst: Set<string>          = new Set();
-
-  const ALERT_COOLDOWN_MS = 30_000; // 30s between same-type burst alerts
-  const lastBurstAlert: Map<string, number> = new Map();
+  const analyzer = new WatchAnalyzer({ burstThreshold, burstWindowMs, denyStreak });
 
   function printAlert(label: string, msg: string): void {
     const ts = new Date().toLocaleTimeString();
@@ -981,47 +973,17 @@ async function cmdWatch(flags: string[]): Promise<void> {
 
   function analyzeEntry(entry: AuditEntry): void {
     const tool    = entry.tool ?? 'unknown';
-    const verdict = entry.verdict ?? 'unknown';
-    const ts      = entry.ts ? new Date(entry.ts).getTime() : Date.now();
+    const verdict = (entry.verdict ?? 'unknown') as string;
 
-    // ── Burst detection ───────────────────────────────────────────────────────
-    const calls = burstBuckets.get(tool) ?? [];
-    const cutoff = ts - burstWindowMs;
-    const recent = calls.filter(t => t >= cutoff);
-    recent.push(ts);
-    burstBuckets.set(tool, recent);
-
-    if (recent.length >= burstThreshold) {
-      const lastAlert = lastBurstAlert.get(tool) ?? 0;
-      if (ts - lastAlert > ALERT_COOLDOWN_MS) {
-        lastBurstAlert.set(tool, ts);
-        printAlert('BURST',
-          `${pc.bold(tool)} called ${pc.yellow(String(recent.length))} times in the last ${
-            Math.round(burstWindowMs / 1000)}s`
-        );
+    const alerts = analyzer.analyze(entry);
+    for (const alert of alerts) {
+      if (alert.type === 'burst') {
+        printAlert('BURST', `${pc.bold(alert.tool)} called ${pc.yellow(String(alert.count))} times in the last ${Math.round(burstWindowMs / 1000)}s`);
+      } else if (alert.type === 'deny-streak') {
+        printAlert('DENY STREAK', `${pc.bold(alert.tool)} denied ${pc.red(String(alert.count))} times in a row`);
+      } else if (alert.type === 'kill-switch') {
+        printAlert('KILL SWITCH', `${pc.bold(alert.tool)} blocked — kill switch is active`);
       }
-    }
-
-    // ── Consecutive deny streak ───────────────────────────────────────────────
-    if (verdict === 'deny' || verdict === 'killed') {
-      const streak = (denyStreaks.get(tool) ?? 0) + 1;
-      denyStreaks.set(tool, streak);
-
-      if (streak >= denyStreak) {
-        printAlert('DENY STREAK',
-          `${pc.bold(tool)} denied ${pc.red(String(streak))} times in a row`
-        );
-      }
-    } else {
-      denyStreaks.delete(tool); // reset streak on allow
-    }
-
-    // ── Kill switch event ─────────────────────────────────────────────────────
-    if (verdict === 'killed') {
-      const reason = (entry as unknown as Record<string, unknown>)['reason'] as string | undefined;
-      printAlert('KILL SWITCH',
-        `${pc.bold(tool)} blocked — kill switch is active${reason ? `: ${reason}` : ''}`
-      );
     }
 
     // ── Normal output (unless silent) ─────────────────────────────────────────
