@@ -49,6 +49,8 @@ export interface WardenConfig {
   rateLimit?: RateLimitConfig;
   /** Optional webhook alerts on deny/kill events. */
   webhook?: WebhookConfig;
+  /** Optional audit log rotation. */
+  rotate?: RotateConfig;
 }
 
 /**
@@ -133,6 +135,21 @@ export interface ScrubberConfig {
    * when enabled is true.
    */
   patterns?: string[];
+}
+
+/**
+ * Audit log rotation configuration.
+ */
+export interface RotateConfig {
+  enabled: boolean;
+  /** Rotate when the log exceeds this many bytes. Default: 10 MiB. */
+  maxBytes?: number;
+  /** Rotate when the log is older than this many milliseconds. */
+  maxAgeMs?: number;
+  /** Number of rotated backup files to keep. Default: 5. */
+  maxFiles?: number;
+  /** Gzip-compress rotated files. Default: true. */
+  compress?: boolean;
 }
 
 /**

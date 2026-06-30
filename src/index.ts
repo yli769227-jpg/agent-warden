@@ -10,4 +10,5 @@ export { loadConfig, resolveConfigPath } from './config.js';
 export { createRateLimiter, RateLimiter, RateLimitError } from './ratelimit.js';
 export { createWebhookAlerter, WebhookAlerter } from './webhook.js';
 export type { AlertEvent, AlertPayload, WebhookTarget } from './webhook.js';
+export { createLogRotator, LogRotator } from './rotate.js';
 export * from './types.js';

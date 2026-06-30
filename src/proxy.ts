@@ -32,6 +32,7 @@ import { createAuditLogger } from './audit.js';
 import { KillSwitch } from './killswitch.js';
 import { createRateLimiter, RateLimitError } from './ratelimit.js';
 import { createWebhookAlerter } from './webhook.js';
+import { createLogRotator } from './rotate.js';
 import type { AuditEntry, ServerConfig, WardenConfig } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -77,6 +78,7 @@ export async function runProxy(config: WardenConfig): Promise<void> {
   const ks          = new KillSwitch();
   const rateLimiter = config.rateLimit ? createRateLimiter(config.rateLimit) : null;
   const alerter     = config.webhook   ? createWebhookAlerter(config.webhook)  : null;
+  const rotator     = config.rotate    ? createLogRotator(config.logFile, config.rotate) : null;
 
   // Start watching the sentinel file immediately.
   ks.watch();
@@ -168,6 +170,13 @@ export async function runProxy(config: WardenConfig): Promise<void> {
       },
       async (args) => {
         const startMs = Date.now();
+
+        // Rotate audit log if needed (fire-and-forget, non-blocking)
+        if (rotator?.needsRotation()) {
+          rotator.rotate().catch((err: unknown) => {
+            log(`Rotation error: ${(err as Error).message}`);
+          });
+        }
 
         // Scrub args once; reused for audit regardless of verdict.
         const scrubbedArgs = scrub(args);

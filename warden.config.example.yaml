@@ -328,3 +328,34 @@ webhook:
     # - url: "https://ops.example.com/warden-alerts"
     #   secret: "${WARDEN_WEBHOOK_SECRET}"   # sent as X-Warden-Secret header
     #   maxRetries: 5
+
+
+# ---------------------------------------------------------------------------
+# rotate  (optional — disabled by default)
+#
+# Size-based and/or time-based log rotation with optional gzip compression.
+#
+# When the audit log exceeds maxBytes or maxAgeMs, Warden:
+#   1. Renames audit.jsonl → audit.jsonl.1  (shifts existing backups up)
+#   2. Compresses the rotated file to .1.gz  (if compress: true)
+#   3. Deletes backups beyond maxFiles
+#
+# Rotation is triggered at the start of each tool call (non-blocking).
+# ---------------------------------------------------------------------------
+rotate:
+
+  enabled: true
+
+  # Rotate when the log exceeds this size.  Default: 10 MiB.
+  maxBytes: 10485760  # 10 MiB
+
+  # Rotate when the log is older than this (milliseconds).
+  # Useful for daily or weekly rotation regardless of size.
+  # Default: no age-based rotation.
+  # maxAgeMs: 86400000   # 24 hours
+
+  # Number of rotated backup files to keep.  Default: 5.
+  maxFiles: 5
+
+  # Gzip-compress rotated files to save disk space.  Default: true.
+  compress: true
