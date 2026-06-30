@@ -380,6 +380,23 @@ async function cmdCheck(configArg?: string): Promise<void> {
   console.log(`  Default action  : ${config.policy.defaultAction}`);
   console.log(`  Policy rules    : ${config.policy.rules?.length ?? 0}`);
   console.log(`  Scrubber        : ${config.scrubber.enabled ? 'enabled' : 'disabled'}`);
+
+  if (config.rateLimit) {
+    const rl = config.rateLimit;
+    const ruleCount = rl.rules?.length ?? 0;
+    console.log(`  Rate limiting   : ${rl.enabled ? `enabled (${ruleCount} rule${ruleCount !== 1 ? 's' : ''})` : 'disabled'}`);
+  } else {
+    console.log(`  Rate limiting   : not configured`);
+  }
+
+  if (config.webhook) {
+    const wh = config.webhook;
+    const targetCount = wh.targets?.length ?? 0;
+    const events = wh.on?.join(', ') ?? 'deny, kill, rate-limit';
+    console.log(`  Webhook alerts  : ${wh.enabled ? `enabled (${targetCount} target${targetCount !== 1 ? 's' : ''}, on: ${events})` : 'disabled'}`);
+  } else {
+    console.log(`  Webhook alerts  : not configured`);
+  }
 }
 
 // ─── Command: init ────────────────────────────────────────────────────────────

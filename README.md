@@ -1,6 +1,6 @@
 # agent-warden 🛡️
 
-> A local MCP audit proxy that logs every tool call, enforces allow/deny policies, and gives you a kill switch — before the agent does something you can't undo.
+> A local MCP audit proxy that logs every tool call, enforces allow/deny policies, rate-limits runaway agents, and gives you a kill switch — before the agent does something you can't undo.
 
 [![CI](https://github.com/yli769227-jpg/agent-warden/actions/workflows/ci.yml/badge.svg)](https://github.com/yli769227-jpg/agent-warden/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/agent-warden)](https://www.npmjs.com/package/agent-warden)
@@ -15,13 +15,6 @@ MCP changed what AI agents can do. In 2026, a single `claude --mcp-server filesy
 
 Once you say "go," you have no intercept layer. The agent talks directly to the MCP server. Nothing in between.
 
-**The numbers are not reassuring:**
-- **30 CVEs** filed against MCP infrastructure in the first 60 days after widespread adoption
-- **492 MCP servers** found exposed on the public internet with zero authentication
-- Prompt injection attacks that redirect tool calls mid-task — with no audit trail to reconstruct what happened
-
-The core issue isn't that MCP is poorly designed. It's that the threat model assumes you'll be watching. You won't always be watching.
-
 Enterprise teams have answered this with cloud-hosted MCP gateways — paid, SaaS, requiring you to route all tool calls through their infrastructure. That's the wrong tradeoff for most developers: you're adding an external dependency to solve a local security problem.
 
 agent-warden is the local answer.
@@ -32,20 +25,19 @@ agent-warden is the local answer.
 
 Warden sits as a transparent proxy in the stdio chain between your MCP client (Claude Code, Claude Desktop, or any MCP-compatible tool) and your MCP servers. Every tool call passes through Warden first.
 
-**Audit logging**
-Every tool invocation is written to a JSONL audit log: tool name, full arguments, response status, duration in milliseconds, and a timestamp. The log is append-only. Secrets are scrubbed before writing.
+**Audit logging** — Every tool invocation is written to a JSONL audit log: tool name, full arguments, verdict, duration, and timestamp. The log is append-only. Secrets are scrubbed before writing.
 
-**Policy engine**
-Define allow/deny rules by tool name with glob support. `filesystem/write_*` can be blocked entirely. `filesystem/read_file` can be allowed only for paths under `/Users/you/project`. Rules are evaluated in order; first match wins. Unmatched calls fall through to a configurable default (`allow` in audit mode, `deny` in enforce mode).
+**Policy engine** — Define allow/deny rules by tool name with glob support. `filesystem/write_*` can be blocked entirely. Rules are evaluated in order; first match wins.
 
-**Dangerous tool auto-detection**
-Warden ships with a built-in list of tool patterns that warrant extra caution: shell execution, file deletion, git force-push, network egress, credential access. These are flagged in the audit log automatically, even if you haven't written a policy for them. You can extend or override the list in config.
+**Dangerous tool auto-detection** — Warden ships with a built-in list of patterns that warrant extra caution: shell execution, file deletion, truncate, purge. These are flagged in the audit log automatically.
 
-**Secret scrubbing**
-Before any log line is written to disk, Warden runs a scrubber over argument payloads. Patterns covering AWS keys, GitHub tokens, SSH private keys, Bearer tokens, and generic high-entropy strings are redacted and replaced with `[REDACTED]`. The upstream MCP server still receives the original payload — scrubbing is log-side only.
+**Secret scrubbing** — Before any log line is written, Warden scrubs argument payloads. AWS keys, GitHub tokens, SSH private keys, Bearer tokens, and high-entropy strings are replaced with `[REDACTED]`. The downstream server still receives the original payload — scrubbing is log-side only.
 
-**Kill switch**
-One command pauses all tool call forwarding instantly. No restart required. Claude Code (or whatever client you're using) sees its next tool call return an error. You have time to inspect the audit log, understand what happened, and decide whether to resume or terminate the session.
+**Rate limiting** — Per-tool call rate limits with token-bucket semantics. Protect against runaway agents that call the same tool dozens of times per minute without blocking legitimate use.
+
+**Webhook alerts** — Push HTTP(S) notifications to Slack, PagerDuty, or any endpoint when Warden blocks or kills a call. Know what your agent did even when you're not watching.
+
+**Kill switch** — One command pauses all tool call forwarding instantly. No restart required.
 
 ---
 
@@ -53,21 +45,33 @@ One command pauses all tool call forwarding instantly. No restart required. Clau
 
 ```
 Claude Code ──stdio──▶ agent-warden ──stdio──▶ filesystem MCP server
-                             │
-                        audit.jsonl
-                      (secrets scrubbed)
+                              │
+                         audit.jsonl
+                       (secrets scrubbed)
 ```
 
-Warden implements the MCP protocol on both sides. To your MCP client it looks like an MCP server. To your downstream MCP servers it looks like an MCP client. It proxies the full protocol — tool listings, resource reads, prompt requests — and intercepts at the tool-call layer.
+Warden implements the MCP protocol on both sides. To your MCP client it looks like an MCP server. To your downstream MCP servers it looks like an MCP client.
 
-Multiple downstream servers are supported. Warden fans out to each server defined in config and merges their tool namespaces, prefixed by server name to avoid collisions.
+Multiple downstream servers are supported. Warden fans out to each server defined in config and merges their tool namespaces, prefixed by server name:
 
 ```
 Claude Code ──stdio──▶ agent-warden ──stdio──▶ filesystem MCP server
-                             │       ──stdio──▶ github MCP server
-                             │       ──stdio──▶ shell MCP server
-                             │
-                        audit.jsonl
+                              │       ──stdio──▶ github MCP server
+                              │       ──stdio──▶ shell MCP server
+                              │
+                         audit.jsonl
+                       (webhook alerts)
+```
+
+**Request evaluation order (each tool call):**
+
+```
+1. Kill switch active? ──yes──▶ deny (verdict: "killed")
+2. Rate limit exceeded? ─yes──▶ deny (verdict: "deny")
+3. Policy rule match? ───yes──▶ enforce/log
+4. Dangerous pattern? ───yes──▶ flag (enforce mode: deny)
+5. Default action ────────────▶ allow or deny
+6. Forward to downstream server
 ```
 
 ---
@@ -75,22 +79,17 @@ Claude Code ──stdio──▶ agent-warden ──stdio──▶ filesystem MC
 ## Quick Start
 
 ```bash
-# Install globally
+# Install globally (or use npx without installing)
 npm install -g agent-warden
 
-# Or use without installing
-npx agent-warden init
-```
-
-```bash
 # Generate warden.config.yaml in the current directory
-npx agent-warden init
+warden init
 
-# Verify Warden can connect to all downstream servers defined in config
-npx agent-warden check
+# Verify Warden can connect to all downstream servers
+warden check
 
 # Start the proxy (stdio mode, ready for MCP client connection)
-npx agent-warden start
+warden run
 ```
 
 **Wire it into Claude Code** by editing `.claude/settings.json`:
@@ -99,131 +98,40 @@ npx agent-warden start
 {
   "mcpServers": {
     "warden": {
-      "command": "npx",
-      "args": ["agent-warden", "start", "--config", "/path/to/warden.config.yaml"],
-      "env": {}
+      "command": "warden",
+      "args": ["run", "/path/to/warden.config.yaml"]
     }
   }
 }
 ```
 
-Remove the direct MCP server entries from your settings — Warden takes over routing to them. Your tool calls still work. Now they're logged and policy-checked.
-
-**Claude Desktop** users: same pattern in `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "warden": {
-      "command": "npx",
-      "args": ["agent-warden", "start"],
-      "cwd": "/Users/you/your-project"
-    }
-  }
-}
-```
+Remove the direct MCP server entries — Warden takes over routing to them. Your tool calls still work. Now they're logged and policy-checked.
 
 ---
 
 ## Config Reference
 
-`warden.config.yaml` — generated by `npx agent-warden init`, annotated here in full:
+Full annotated reference: [`warden.config.example.yaml`](warden.config.example.yaml)
+
+Minimal working example:
 
 ```yaml
-# agent-warden configuration
-# https://github.com/yli769227-jpg/agent-warden
+mode: enforce
 
-# Downstream MCP servers Warden proxies to.
-# Tool names will be prefixed with the server key (e.g., "filesystem/read_file").
 servers:
   filesystem:
     command: npx
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you"]
-  github:
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_TOKEN: "${GITHUB_TOKEN}"  # resolved from environment at startup
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/projects"]
 
-# Audit log settings
-audit:
-  # Path to the JSONL audit log. Rotated daily by default.
-  path: "./warden-audit.jsonl"
-  # Rotate logs when they exceed this size (bytes). 0 = no size-based rotation.
-  max_size_bytes: 10485760  # 10 MB
-  # Keep this many rotated log files before deleting old ones.
-  keep_rotated: 7
-  # Write a summary line to stdout for each tool call (useful during development).
-  console: true
-
-# Secret scrubbing — applied to all log writes, not to upstream payloads.
-scrubbing:
-  enabled: true
-  # Built-in patterns: aws_key, github_token, bearer_token, ssh_private_key,
-  # high_entropy_string. List patterns here to disable specific built-ins.
-  disable_patterns: []
-  # Add your own regex patterns. Matched groups are replaced with [REDACTED].
-  custom_patterns:
-    - 'MY_INTERNAL_SECRET_[A-Z0-9]{32}'
-
-# Policy engine
 policy:
-  # "audit"   — log everything, block nothing. Good for day-one visibility.
-  # "enforce" — apply rules below; deny by default if no rule matches.
-  mode: audit
-
-  # Rules are evaluated top-to-bottom. First match wins.
-  # Glob patterns are supported for tool names.
+  defaultAction: allow
   rules:
-    # Allow read-only filesystem access anywhere
-    - tool: "filesystem/read_*"
-      action: allow
-
-    # Block all write operations outside the project directory
     - tool: "filesystem/write_file"
       action: deny
-      reason: "Write access restricted — switch to enforce mode and add an allow rule for your project path."
+      reason: "Filesystem writes require explicit approval"
 
-    # Block file deletion entirely
-    - tool: "filesystem/*delete*"
-      action: deny
-      reason: "Deletion blocked by policy."
-
-    # Allow all GitHub read operations
-    - tool: "github/get_*"
-      action: allow
-    - tool: "github/list_*"
-      action: allow
-
-    # Block force push
-    - tool: "github/push_files"
-      action: deny
-      when:
-        args_match:
-          force: true
-      reason: "Force push blocked by policy."
-
-# Dangerous tool detection — these patterns are flagged in the audit log
-# regardless of policy outcome. Extend or replace the built-in list here.
-dangerous_tools:
-  # Use "extend" to add to the built-in list, "replace" to define your own.
-  mode: extend
-  patterns:
-    - "*exec*"
-    - "*shell*"
-    - "*run_command*"
-    - "*delete*"
-    - "*destroy*"
-    - "*drop_*"
-
-# Kill switch
-kill_switch:
-  # Path to the kill switch file. When this file exists, all tool calls are blocked.
-  # Create it with: npx agent-warden kill
-  # Remove it with: npx agent-warden resume
-  path: "/tmp/warden.kill"
-  # Message returned to the MCP client when the kill switch is active.
-  message: "agent-warden kill switch is active. Run `npx agent-warden resume` to unblock."
+scrubber:
+  enabled: true
 ```
 
 ---
@@ -232,17 +140,13 @@ kill_switch:
 
 | Command | Description |
 |---|---|
-| `agent-warden init` | Generate `warden.config.yaml` in the current directory with safe defaults |
-| `agent-warden start` | Start the proxy in stdio mode (for use as an MCP server) |
-| `agent-warden check` | Connect to all downstream servers and verify tool listings are reachable |
-| `agent-warden kill` | Activate the kill switch — all subsequent tool calls return an error immediately |
-| `agent-warden resume` | Deactivate the kill switch and resume normal proxying |
-| `agent-warden tail` | Stream the audit log to stdout in human-readable format |
-| `agent-warden stats` | Print tool call counts, deny rates, and flagged calls from the current log |
-| `agent-warden scrub <file>` | Re-run secret scrubbing over an existing log file (in-place, with backup) |
-| `agent-warden validate` | Parse and validate `warden.config.yaml` without starting the proxy |
-
-All commands accept `--config <path>` to specify a non-default config file location.
+| `warden run [config]` | Start the proxy in stdio mode |
+| `warden kill [reason]` | Arm the kill switch — all tool calls denied immediately |
+| `warden unkill` | Disarm the kill switch and resume normal proxying |
+| `warden log` | Stream the audit log to stdout in follow mode (Ctrl+C to stop) |
+| `warden stats` | Print tool call counts and deny rates from the current log |
+| `warden check [config]` | Verify config and probe downstream server reachability |
+| `warden init` | Generate `warden.config.yaml` in the current directory |
 
 ---
 
@@ -250,25 +154,128 @@ All commands accept `--config <path>` to specify a non-default config file locat
 
 ### `audit` mode (default)
 
-Every tool call is logged and secret-scrubbed. Policy rules are evaluated and their outcome is recorded, but calls are **never blocked** — even if a matching rule says `deny`. This is the right starting point: run a session, review the log, understand what tools your agent actually calls, then write rules based on observed behavior.
+Every tool call is logged and scrubbed. Policy rules are evaluated and recorded, but calls are **never blocked** — even if a matching rule says `deny`. Use this while writing your policy.
 
 ```yaml
-policy:
-  mode: audit
+mode: audit
 ```
-
-No traffic is interrupted. The audit log is your output.
 
 ### `enforce` mode
 
-Policy rules are enforced. A `deny` rule blocks the call and returns an error to the MCP client. Calls that match no rule are **denied by default** — you must explicitly allow what you want. This is the right mode for production or any session where the agent has access to sensitive resources.
+Policy rules are authoritative. A `deny` verdict blocks the call and returns an error to the MCP client.
+
+```yaml
+mode: enforce
+```
+
+Workflow: start with `audit`, review the log with `warden log` and `warden stats`, add `allow` rules for legitimate patterns, then switch to `enforce`.
+
+---
+
+## Policy Rules
+
+Rules are evaluated top-to-bottom; first match wins. `*` is the wildcard character.
 
 ```yaml
 policy:
-  mode: enforce
+  defaultAction: allow    # or "deny" for strict allowlist mode
+  rules:
+    # Server-specific rules using prefix
+    - tool: "filesystem/read_file"
+      action: allow
+
+    - tool: "filesystem/write_file"
+      action: deny
+      reason: "Writes require explicit approval"
+
+    # Cross-server glob patterns
+    - tool: "*delete*"
+      action: deny
+      reason: "Deletion requires policy exception"
+
+    # Allow all GitHub read operations
+    - tool: "github/get_*"
+      action: allow
+    - tool: "github/list_*"
+      action: allow
+
+    # Block all GitHub mutations
+    - tool: "github/create_*"
+      action: deny
 ```
 
-Start with `audit`, review the log with `agent-warden stats`, add `allow` rules for legitimate tool patterns, then switch to `enforce`.
+With `defaultAction: deny`, every tool must be explicitly allowed — a strict allowlist. With `defaultAction: allow`, only listed tools are blocked — a denylist. Most teams start with `allow` and add denies for specific tools they want to gate.
+
+---
+
+## Rate Limiting
+
+Prevent runaway agents from calling the same tool too many times within a window.
+
+```yaml
+rateLimit:
+  enabled: true
+  rules:
+    # At most 3 delete calls per 5 minutes
+    - tool: "*delete*"
+      capacity: 3
+      windowMs: 300000
+
+    # At most 10 filesystem writes per minute
+    - tool: "filesystem/write_file"
+      capacity: 10
+      windowMs: 60000
+
+    # Conservative global fallback
+    - tool: "*"
+      capacity: 60
+      windowMs: 60000
+```
+
+**Semantics:**
+- Token-bucket with continuous refill — capacity tokens per window, one consumed per call.
+- Each tool name has its own independent bucket. `github/*` with capacity 5 means each individual GitHub tool can be called 5 times, not 5 calls total across all GitHub tools.
+- First matching rule wins (same evaluation order as policy).
+- Rate-limited calls are logged with verdict `deny` and a retryAfterMs hint.
+- When no rule matches, the tool is not rate-limited.
+
+---
+
+## Webhook Alerts
+
+Push notifications to Slack, PagerDuty, or any HTTP(S) endpoint when Warden blocks or kills a call.
+
+```yaml
+webhook:
+  enabled: true
+  on:
+    - deny
+    - kill
+    - rate-limit
+
+  targets:
+    - url: "https://hooks.slack.com/services/T000/B000/xxxx"
+      maxRetries: 3
+
+    - url: "https://ops.example.com/warden-alerts"
+      secret: "${WARDEN_WEBHOOK_SECRET}"   # sent as X-Warden-Secret header
+```
+
+**Payload shape:**
+
+```json
+{
+  "source":  "agent-warden",
+  "version": "0.1.0",
+  "ts":      "2024-01-01T00:00:00.000Z",
+  "event":   "deny",
+  "tool":    "filesystem/delete_file",
+  "reason":  "Deletion is irreversible",
+  "args":    { "path": "/Users/you/important.txt" }
+}
+```
+
+Delivery is fire-and-forget with exponential retry (default 3 attempts, base 1 s, cap 30 s). A webhook failure never blocks the proxy response path.
 
 ---
 
@@ -278,38 +285,155 @@ The kill switch is a circuit breaker for situations where you need to stop an ag
 
 ```bash
 # Block all tool calls right now
-npx agent-warden kill
+warden kill "suspicious activity detected"
 
 # Resume normal operation
-npx agent-warden resume
+warden unkill
 ```
 
-When the kill switch is active, Warden returns an MCP error response to every tool call. The agent sees the error and typically stops or asks for guidance. Your session stays open. No restarts.
+When the kill switch is active, Warden returns an MCP error response to every tool call. The agent sees the error and typically stops or asks for guidance. Your session stays open.
 
-**Why this matters:** MCP agents can move fast. A misunderstood instruction or a prompt injection mid-task can trigger a cascade of tool calls in seconds. The kill switch is the difference between pausing to investigate and spending an hour on `git reflog`.
+The kill switch is implemented as a sentinel file (`~/.warden/killswitch` by default, overridable via `WARDEN_KILLSWITCH` env var). This means:
+- It survives Warden restarts
+- It can be triggered from any terminal or script
+- You can bind it to a keyboard shortcut: `alias panic='warden kill "emergency stop"'`
 
-The kill switch is implemented as a file on disk (`/tmp/warden.kill` by default, configurable). This means it survives Warden restarts and can be triggered from any terminal — a separate shell, a script, a keyboard shortcut bound to `npx agent-warden kill`.
+---
+
+## Audit Log
+
+The log is JSONL — one JSON object per line:
+
+```jsonl
+{"ts":"2024-01-01T00:00:00.000Z","tool":"filesystem/read_file","args":{"path":"/home/user/file.txt"},"verdict":"allow","durationMs":12}
+{"ts":"2024-01-01T00:00:01.000Z","tool":"filesystem/write_file","args":{"path":"/etc/passwd","content":"[REDACTED]"},"verdict":"deny","reason":"Filesystem writes require explicit approval"}
+{"ts":"2024-01-01T00:00:02.000Z","tool":"github/delete_repo","args":{"owner":"you","repo":"myrepo"},"verdict":"killed","reason":"kill switch active — emergency stop"}
+```
+
+Stream it live:
+
+```bash
+warden log
+```
+
+Get statistics:
+
+```bash
+warden stats
+```
+
+Ship to a SIEM:
+
+```bash
+tail -f ~/.warden/audit.jsonl | jq -c . | nc your-siem-host 5514
+```
+
+---
+
+## Secret Scrubbing
+
+Warden scrubs the following patterns from logged payloads before writing to disk:
+
+| Pattern | Example |
+|---|---|
+| AWS access key IDs | `AKIA...` → `[REDACTED]` |
+| GitHub tokens | `ghp_...`, `ghs_...`, `gho_...` → `[REDACTED]` |
+| Bearer tokens | `Bearer abc123` → `Bearer [REDACTED]` |
+| SSH private keys | `-----BEGIN ...` → `[REDACTED]` |
+| `.env`-style assignments | `API_KEY=abc123` → `[REDACTED]` |
+
+Add custom patterns in config:
+
+```yaml
+scrubber:
+  enabled: true
+  patterns:
+    - "svc_[A-Za-z0-9]{32,}"           # internal service tokens
+    - "postgres://[^:]+:[^@]+@[^/\\s]+"  # database connection strings
+```
+
+---
+
+## Multi-Server Setup
+
+Configure multiple downstream servers. Warden fans out connections at startup and prefixes tool names to avoid collisions:
+
+```yaml
+servers:
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/path"]
+
+  github:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+
+  myserver:
+    command: node
+    args: ["/path/to/my-mcp-server/dist/index.js"]
+```
+
+Tool names become:
+- `filesystem/read_file`, `filesystem/write_file`, …
+- `github/get_file`, `github/create_issue`, …
+- `myserver/custom_tool`, …
+
+Policy rules can target a specific server with the prefix:
+
+```yaml
+rules:
+  - tool: "filesystem/*"    # all filesystem tools
+    action: allow
+  - tool: "github/create_*" # only GitHub create operations
+    action: deny
+  - tool: "*"               # catch-all for all servers
+    action: deny
+```
 
 ---
 
 ## Why not just use [X]?
 
-**Enterprise MCP gateways** (Invariant, Portkey, others): cloud-hosted, paid, require you to route your tool calls through external infrastructure. Useful if your team is large and you need centralized policy management. Overkill if you're a developer who wants visibility into what's happening on your own machine.
+**Enterprise MCP gateways** (Invariant, Portkey, others): cloud-hosted, paid, require routing your tool calls through external infrastructure. Useful for large teams. Overkill for individual developers who want visibility into their own machine.
 
-**MCP server built-in auth**: some servers implement their own access controls. This is good, but it's per-server and inconsistent. You get no cross-server audit trail, no unified policy layer, and no kill switch.
+**MCP server built-in auth**: per-server and inconsistent. No cross-server audit trail, no unified policy layer, no kill switch.
 
-**Reading Claude's output carefully**: works until it doesn't. Prompt injection attacks are specifically designed to not surface in Claude's visible reasoning. The tool calls happen; you don't see them until the log already has the answer.
+**Reading Claude's output carefully**: prompt injection attacks are designed to not surface in visible reasoning. The tool calls happen; you don't see them until it's too late.
 
-**agent-warden**: runs locally, free, zero external dependencies, open source, installs in 30 seconds. It doesn't try to replace enterprise infrastructure — it gives individual developers the observability layer that should have been there from the start.
+**agent-warden**: runs locally, free, zero external dependencies, open source. Installs in 30 seconds. Doesn't require a SaaS contract.
 
 ---
 
 ## Roadmap
 
-- **Web dashboard** — a local browser UI to view the audit log, filter by tool/server/outcome, and visualize call patterns over a session
-- **OPA policy integration** — use Open Policy Agent `.rego` files as the policy engine for teams that already have OPA in their stack
-- **Rate limiting** — cap tool calls per minute per tool or per server, with configurable backoff behavior
-- **Slack/webhook alerts on deny** — push a notification when a policy deny fires or the kill switch is activated, so you know something unexpected happened even when you're not watching the terminal
+- [x] Multi-server proxy with tool name prefixing
+- [x] Policy engine with glob rules and dangerous-tool detection
+- [x] JSONL audit log with secret scrubbing
+- [x] Kill switch (file-based, instant)
+- [x] Rate limiting (token-bucket per tool)
+- [x] Webhook alerts (deny / kill / rate-limit events)
+- [ ] Web dashboard — local browser UI to view audit log and visualize call patterns
+- [ ] Log rotation — size or time-based JSONL rotation with compression
+- [ ] OPA integration — use Open Policy Agent `.rego` files as the policy engine
+- [ ] OpenTelemetry export — emit audit entries as OTEL spans
+
+---
+
+## Development
+
+```bash
+git clone https://github.com/yli769227-jpg/agent-warden.git
+cd agent-warden
+npm install --include=optional
+npm run build
+npm test              # 70 tests (60 unit + 10 integration)
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow and PR checklist.
+
+For security vulnerabilities, see [SECURITY.md](SECURITY.md).
 
 ---
 
