@@ -42,7 +42,7 @@ function printUsage(): void {
       `  ${pc.cyan('run [config]')}      Start the warden proxy (reads config file)`,
       `  ${pc.cyan('kill [reason]')}     Arm the kill switch — all tool calls denied`,
       `  ${pc.cyan('unkill')}            Disarm the kill switch`,
-      `  ${pc.cyan('log')}               Tail the audit log in follow mode`,
+      `  ${pc.cyan('log')}               Tail the audit log in follow mode (--tool, --verdict, --since, --no-follow)`,
       `  ${pc.cyan('stats')}             Show audit statistics (counts by verdict / tool)`,
       `  ${pc.cyan('check [config]')}    Verify config and downstream server reachability`,
       `  ${pc.cyan('init')}              Write a starter warden.config.yaml in the current directory`,
@@ -148,11 +148,69 @@ async function waitForFile(filePath: string): Promise<void> {
   });
 }
 
-async function cmdLog(): Promise<void> {
+interface LogFilter {
+  tool?: string;
+  verdict?: string;
+  since?: Date;
+  follow: boolean;
+}
+
+/** Parses `--since` values: "1h", "30m", "2d", or an ISO-8601 timestamp. */
+function parseSince(value: string): Date {
+  const match = /^(\d+)(m|h|d)$/.exec(value);
+  if (match) {
+    const n    = parseInt(match[1]!, 10);
+    const unit = match[2]!;
+    const ms   = unit === 'm' ? n * 60_000 : unit === 'h' ? n * 3_600_000 : n * 86_400_000;
+    return new Date(Date.now() - ms);
+  }
+  const d = new Date(value);
+  if (isNaN(d.getTime())) throw new Error(`Invalid --since value: "${value}"`);
+  return d;
+}
+
+function entryMatchesFilter(line: string, filter: LogFilter): boolean {
+  if (!line.trim()) return false;
+  let entry: AuditEntry;
+  try {
+    entry = JSON.parse(line) as AuditEntry;
+  } catch {
+    return true; // show unparseable lines
+  }
+  if (filter.tool) {
+    const pattern = filter.tool.includes('*')
+      ? new RegExp('^' + filter.tool.split('*').map(s => s.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('.*') + '$')
+      : null;
+    const match = pattern ? pattern.test(entry.tool ?? '') : (entry.tool ?? '').includes(filter.tool);
+    if (!match) return false;
+  }
+  if (filter.verdict && entry.verdict !== filter.verdict) return false;
+  if (filter.since && entry.ts && new Date(entry.ts) < filter.since) return false;
+  return true;
+}
+
+async function cmdLog(flags: string[]): Promise<void> {
+  // Parse flags: --tool <pat>, --verdict <v>, --since <spec>, --no-follow
+  const filter: LogFilter = { follow: true };
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === '--no-follow' || f === '-n') {
+      filter.follow = false;
+    } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
+      filter.tool = flags[++i];
+    } else if ((f === '--verdict' || f === '-v') && flags[i + 1]) {
+      filter.verdict = flags[++i];
+    } else if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      filter.since = parseSince(flags[++i]!);
+    }
+  }
+
   const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
 
   if (!fs.existsSync(logFile)) {
     console.log(pc.yellow(`Log file not found: ${logFile}`));
+    if (!filter.follow) { process.exit(0); }
     console.log('Waiting for it to be created…');
   }
 
@@ -163,9 +221,12 @@ async function cmdLog(): Promise<void> {
   const rl = readline.createInterface({ input: readStream, crlfDelay: Infinity });
 
   for await (const line of rl) {
+    if (!entryMatchesFilter(line, filter)) continue;
     const formatted = formatAuditLine(line);
     if (formatted) console.log(formatted);
   }
+
+  if (!filter.follow) return;
 
   // ── Follow mode ───────────────────────────────────────────────────────────
   let position = fs.statSync(logFile).size;
@@ -183,6 +244,7 @@ async function cmdLog(): Promise<void> {
       position = stat.size;
 
       for (const line of buf.toString('utf8').split('\n')) {
+        if (!entryMatchesFilter(line, filter)) continue;
         const formatted = formatAuditLine(line);
         if (formatted) console.log(formatted);
       }
@@ -497,7 +559,7 @@ async function main(): Promise<void> {
       break;
 
     case 'log':
-      await cmdLog();
+      await cmdLog(argv.slice(1));
       break;
 
     case 'stats':
