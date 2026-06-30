@@ -88,6 +88,7 @@ function printUsage(): void {
       `  ${pc.cyan('snapshot')}           Save a timestamped JSON snapshot of current audit stats`,
       `  ${pc.cyan('compare')}            Compare two snapshot files and show regressions`,
       `  ${pc.cyan('trending')}           Show which tools are rising or falling in call rate`,
+      `  ${pc.cyan('anomaly-score')}      Compute a 0-100 risk score from recent audit behaviour`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -990,6 +991,153 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: anomaly-score ───────────────────────────────────────────────────
+
+async function cmdAnomalyScore(flags: string[]): Promise<void> {
+  // Computes a composite 0–100 risk score from recent audit log behaviour.
+  //
+  // Score is built from weighted sub-scores:
+  //   denyRate        (40%)  — fraction of calls denied or killed
+  //   dangerousTool   (30%)  — calls to known-dangerous tool patterns
+  //   burstActivity   (15%)  — single tool with >20% of all calls in window
+  //   uniqueTools     (15%)  — very high or very low tool diversity (anomalous)
+  //
+  // Flags:
+  //   --window/-w <hours>   Window to analyse in hours (default 1)
+  //   --json/-j             Machine-readable output
+  //   --threshold N         Exit 1 if score exceeds this value (default disabled)
+
+  const DANGEROUS = /delete|remove|bash|shell|exec|sudo|kill|rm|drop|truncate|format/i;
+
+  let windowHours = 1;
+  let jsonOutput  = false;
+  let threshold: number | null = null;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--window' || f === '-w') && flags[i + 1]) {
+      windowHours = parseFloat(flags[++i]!);
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if (f === '--threshold' && flags[i + 1]) {
+      threshold = parseInt(flags[++i]!, 10);
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Aggregate stats in window ──────────────────────────────────────────────
+  const now    = Date.now();
+  const cutoff = now - windowHours * 3_600_000;
+
+  let total          = 0;
+  let denied         = 0;
+  let dangerousCalls = 0;
+  const toolCounts: Record<string, number> = {};
+
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    const ts = entry.ts ? new Date(entry.ts).getTime() : 0;
+    if (ts < cutoff) continue;
+
+    total++;
+    if (entry.verdict === 'deny' || entry.verdict === 'killed') denied++;
+
+    const tool = entry.tool ?? '(unknown)';
+    if (DANGEROUS.test(tool)) dangerousCalls++;
+    toolCounts[tool] = (toolCounts[tool] ?? 0) + 1;
+  }
+
+  // ── Sub-scores ─────────────────────────────────────────────────────────────
+  // 1. Deny rate score (0–100, linear)
+  const denyRate     = total > 0 ? denied / total : 0;
+  const denyScore    = Math.round(denyRate * 100);
+
+  // 2. Dangerous tool score
+  const dangerRate   = total > 0 ? dangerousCalls / total : 0;
+  const dangerScore  = Math.min(100, Math.round(dangerRate * 150)); // amplified
+
+  // 3. Burst activity score — one tool dominates (>50% of calls) → high risk
+  const maxToolCalls  = total > 0 ? Math.max(...Object.values(toolCounts)) : 0;
+  const burstRatio    = total > 0 ? maxToolCalls / total : 0;
+  const burstScore    = burstRatio > 0.5 ? Math.round((burstRatio - 0.5) * 200) : 0;
+
+  // 4. Tool diversity score
+  //    Too few tools in a long session → suspicious narrow focus
+  //    Too many tools → possible wild tool-calling
+  const uniqueCount = Object.keys(toolCounts).length;
+  let diversityScore = 0;
+  if (total > 10) {
+    if (uniqueCount <= 1) diversityScore = 30;       // only 1 tool + many calls = suspicious
+    else if (uniqueCount > total * 0.8) diversityScore = 20; // each call is a different tool
+  }
+
+  // ── Composite score ────────────────────────────────────────────────────────
+  const composite = Math.min(100, Math.round(
+    denyScore   * 0.40 +
+    dangerScore * 0.30 +
+    burstScore  * 0.15 +
+    diversityScore * 0.15,
+  ));
+
+  const grade =
+    composite >= 80 ? 'CRITICAL' :
+    composite >= 60 ? 'HIGH'     :
+    composite >= 40 ? 'MEDIUM'   :
+    composite >= 20 ? 'LOW'      :
+                      'CLEAN';
+
+  const breakdown = { denyScore, dangerScore, burstScore, diversityScore };
+
+  // ── Output ─────────────────────────────────────────────────────────────────
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      windowHours,
+      total,
+      score: composite,
+      grade,
+      breakdown,
+      inputs: { denyRate: parseFloat(denyRate.toFixed(3)), dangerousCalls, burstRatio: parseFloat(burstRatio.toFixed(3)), uniqueTools: uniqueCount },
+    }, null, 2));
+  } else {
+    const gradeColor =
+      grade === 'CRITICAL' ? pc.bgRed(pc.white(` ${grade} `)) :
+      grade === 'HIGH'     ? pc.red(grade)       :
+      grade === 'MEDIUM'   ? pc.yellow(grade)    :
+      grade === 'LOW'      ? pc.blue(grade)      :
+                             pc.green(grade);
+
+    console.log(`\n${pc.bold('warden anomaly-score')} — last ${windowHours}h\n`);
+    console.log(`  Score : ${pc.bold(String(composite))}/100  ${gradeColor}`);
+    console.log(`  Calls : ${total}  (denied: ${denied}, dangerous: ${dangerousCalls})`);
+    console.log();
+    console.log(pc.dim(`  Breakdown:`));
+    console.log(pc.dim(`    deny rate      ${denyScore.toString().padStart(3)} pts  (weight 40%)`));
+    console.log(pc.dim(`    dangerous tool ${dangerScore.toString().padStart(3)} pts  (weight 30%)`));
+    console.log(pc.dim(`    burst activity ${burstScore.toString().padStart(3)} pts  (weight 15%)`));
+    console.log(pc.dim(`    tool diversity ${diversityScore.toString().padStart(3)} pts  (weight 15%)`));
+    console.log();
+    if (total === 0) {
+      console.log(pc.dim('  (No calls in window — score may not be meaningful)'));
+    }
+  }
+
+  if (threshold !== null && composite >= threshold) {
+    process.exit(1);
   }
 }
 
@@ -3705,6 +3853,11 @@ async function main(): Promise<void> {
 
     case 'trending':
       await cmdTrending(argv.slice(1));
+      break;
+
+    case 'anomaly-score':
+    case 'score':
+      await cmdAnomalyScore(argv.slice(1));
       break;
 
     default:
