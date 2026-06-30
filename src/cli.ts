@@ -70,6 +70,7 @@ function printUsage(): void {
       `  ${pc.cyan('bench')}             Measure per-call policy+scrubber overhead (--iterations N, --json)`,
       `  ${pc.cyan('rotate')}            Manually rotate the audit log (--no-compress, --list)`,
       `  ${pc.cyan('diff')}              Compare before/after stats around a split point (--split, --window, --json)`,
+      `  ${pc.cyan('top')}               Live top-N tools by call count, refreshed every N seconds`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -923,6 +924,143 @@ async function cmdRotate(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: top ─────────────────────────────────────────────────────────────
+
+async function cmdTop(flags: string[]): Promise<void> {
+  // Flags: --n N (default 10), --interval N (seconds, default 5), --once/-1
+  let topN     = 10;
+  let interval = 5;
+  let once     = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--n' || f === '-n') && flags[i + 1]) {
+      const n = parseInt(flags[++i]!, 10);
+      if (!isNaN(n) && n > 0) topN = n;
+    } else if ((f === '--interval' || f === '-i') && flags[i + 1]) {
+      const n = parseInt(flags[++i]!, 10);
+      if (!isNaN(n) && n > 0) interval = n;
+    } else if (f === '--once' || f === '-1') {
+      once = true;
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  async function readTopN(): Promise<{
+    tool: string;
+    total: number;
+    allow: number;
+    deny: number;
+    killed: number;
+    avgMs: number | null;
+  }[]> {
+    const toolStats: Record<string, {
+      total: number; allow: number; deny: number; killed: number;
+      durations: number[];
+    }> = {};
+
+    if (!fs.existsSync(logFile)) return [];
+
+    const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      let entry: AuditEntry;
+      try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+      const t = entry.tool ?? '(unknown)';
+      if (!toolStats[t]) toolStats[t] = { total: 0, allow: 0, deny: 0, killed: 0, durations: [] };
+      toolStats[t]!.total++;
+      if (entry.verdict === 'allow')  toolStats[t]!.allow++;
+      if (entry.verdict === 'deny')   toolStats[t]!.deny++;
+      if (entry.verdict === 'killed') toolStats[t]!.killed++;
+      if (typeof entry.durationMs === 'number') toolStats[t]!.durations.push(entry.durationMs);
+    }
+
+    return Object.entries(toolStats)
+      .sort(([, a], [, b]) => b.total - a.total)
+      .slice(0, topN)
+      .map(([tool, s]) => ({
+        tool,
+        total:  s.total,
+        allow:  s.allow,
+        deny:   s.deny,
+        killed: s.killed,
+        avgMs:  s.durations.length > 0
+          ? Math.round(s.durations.reduce((a, b) => a + b, 0) / s.durations.length)
+          : null,
+      }));
+  }
+
+  function render(rows: Awaited<ReturnType<typeof readTopN>>): void {
+    if (!once) {
+      // Move cursor up to overwrite previous output (after first render)
+      process.stdout.write('\x1b[2J\x1b[H'); // clear screen
+    }
+
+    const now = new Date().toISOString();
+    console.log(`${pc.bold('warden top')} — ${pc.dim(now)}  ${pc.dim(`(refreshes every ${interval}s, Ctrl+C to stop)`)}`);
+    console.log();
+
+    if (rows.length === 0) {
+      console.log(pc.dim(`  No data in ${logFile}`));
+      return;
+    }
+
+    const headerTool    = 'Tool'.padEnd(36);
+    const headerTotal   = 'Calls'.padStart(7);
+    const headerAllow   = 'Allow'.padStart(7);
+    const headerDeny    = 'Deny'.padStart(7);
+    const headerKilled  = 'Killed'.padStart(7);
+    const headerAvg     = 'Avg ms'.padStart(8);
+    console.log(pc.dim(`  ${headerTool}  ${headerTotal}  ${headerAllow}  ${headerDeny}  ${headerKilled}  ${headerAvg}`));
+    console.log(pc.dim(`  ${'─'.repeat(80)}`));
+
+    for (const row of rows) {
+      const toolStr   = row.tool.padEnd(36);
+      const totalStr  = String(row.total).padStart(7);
+      const allowStr  = String(row.allow).padStart(7);
+      const denyStr   = String(row.deny).padStart(7);
+      const killedStr = String(row.killed).padStart(7);
+      const avgStr    = row.avgMs != null ? String(row.avgMs).padStart(8) : '       —';
+
+      const denyColored  = row.deny   > 0 ? pc.red(denyStr)   : denyStr;
+      const killedColored = row.killed > 0 ? pc.bgRed(pc.white(killedStr)) : killedStr;
+
+      console.log(`  ${pc.cyan(toolStr)}  ${totalStr}  ${pc.green(allowStr)}  ${denyColored}  ${killedColored}  ${pc.dim(avgStr)}`);
+    }
+
+    console.log();
+  }
+
+  // First render
+  const rows = await readTopN();
+  render(rows);
+
+  if (once) return;
+
+  // Live-refresh loop
+  const refreshInterval = setInterval(async () => {
+    try {
+      const freshRows = await readTopN();
+      render(freshRows);
+    } catch {
+      // ignore read errors during refresh
+    }
+  }, interval * 1000);
+
+  process.on('SIGINT', () => {
+    clearInterval(refreshInterval);
+    console.log(pc.dim('\n(stopped)'));
+    process.exit(0);
+  });
+
+  // Keep the process alive
+  await new Promise<void>(() => { /* never resolves; SIGINT exits */ });
+}
+
 // ─── Command: diff ────────────────────────────────────────────────────────────
 
 interface PeriodStats {
@@ -1135,6 +1273,10 @@ async function main(): Promise<void> {
 
     case 'diff':
       await cmdDiff(argv.slice(1));
+      break;
+
+    case 'top':
+      await cmdTop(argv.slice(1));
       break;
 
     default:
