@@ -31,6 +31,7 @@ import { createScrubberFromConfig } from './scrubber.js';
 import { createAuditLogger } from './audit.js';
 import { KillSwitch } from './killswitch.js';
 import { createRateLimiter, RateLimitError } from './ratelimit.js';
+import { createWebhookAlerter } from './webhook.js';
 import type { AuditEntry, ServerConfig, WardenConfig } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -75,6 +76,7 @@ export async function runProxy(config: WardenConfig): Promise<void> {
   const audit       = createAuditLogger(config.logFile);
   const ks          = new KillSwitch();
   const rateLimiter = config.rateLimit ? createRateLimiter(config.rateLimit) : null;
+  const alerter     = config.webhook   ? createWebhookAlerter(config.webhook)  : null;
 
   // Start watching the sentinel file immediately.
   ks.watch();
@@ -187,6 +189,7 @@ export async function runProxy(config: WardenConfig): Promise<void> {
             durationMs: Date.now() - startMs,
           };
           audit.log(entry);
+          alerter?.alert('kill', toolName, ksReason, scrubbedArgs);
 
           log(`KILLED ${toolName} — ${ksReason}`);
           return {
@@ -211,6 +214,7 @@ export async function runProxy(config: WardenConfig): Promise<void> {
                 durationMs: Date.now() - startMs,
               };
               audit.log(entry);
+              alerter?.alert('rate-limit', toolName, rlReason, scrubbedArgs);
               log(`RATE-LIMITED ${toolName} — retry after ${Math.ceil(err.retryAfterMs)}ms`);
               return {
                 content: [{ type: 'text' as const, text: `[warden] ${rlReason}` }],
@@ -234,6 +238,7 @@ export async function runProxy(config: WardenConfig): Promise<void> {
             durationMs: Date.now() - startMs,
           };
           audit.log(entry);
+          alerter?.alert('deny', toolName, decision.reason ?? 'policy deny', scrubbedArgs);
 
           log(`DENY ${toolName} — ${decision.reason}`);
           return {

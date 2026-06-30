@@ -47,6 +47,23 @@ export interface WardenConfig {
   scrubber: ScrubberConfig;
   /** Optional per-tool rate limiting. */
   rateLimit?: RateLimitConfig;
+  /** Optional webhook alerts on deny/kill events. */
+  webhook?: WebhookConfig;
+}
+
+/**
+ * Webhook alert configuration.
+ */
+export interface WebhookConfig {
+  enabled: boolean;
+  /** HTTP(S) endpoints to POST alert payloads to. */
+  targets?: Array<{
+    url: string;
+    secret?: string;
+    maxRetries?: number;
+  }>;
+  /** Which event types trigger delivery. Defaults to all. */
+  on?: Array<'deny' | 'kill' | 'rate-limit'>;
 }
 
 /**

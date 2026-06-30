@@ -278,3 +278,53 @@ rateLimit:
     - tool: "*"
       capacity: 60
       windowMs: 60000       # 60 calls/minute per tool (generous default)
+
+
+# ---------------------------------------------------------------------------
+# webhook  (optional)
+#
+# HTTP(S) push notifications sent when warden blocks or kills a tool call.
+# Useful for real-time ops alerts without tailing the audit log.
+#
+# Delivery:
+#   - POST application/json to each target URL
+#   - Failed deliveries are retried with exponential back-off (default 3 tries)
+#   - A webhook failure never blocks the proxy response — it is fire-and-forget
+#
+# Payload shape:
+#   {
+#     "source":  "agent-warden",
+#     "version": "0.1.0",
+#     "ts":      "2024-01-01T00:00:00.000Z",
+#     "event":   "deny" | "kill" | "rate-limit",
+#     "tool":    "filesystem/delete_file",
+#     "reason":  "Deletion is irreversible",
+#     "args":    { ... }   // scrubbed copy of tool arguments
+#   }
+#
+# Receivers:
+#   - Slack incoming webhooks
+#   - PagerDuty events API
+#   - Any HTTP endpoint that accepts JSON POST
+# ---------------------------------------------------------------------------
+webhook:
+
+  enabled: true
+
+  # Events that trigger delivery.
+  # Omit to receive all events (deny + kill + rate-limit).
+  on:
+    - deny
+    - kill
+    - rate-limit
+
+  targets:
+
+    # ── Slack incoming webhook ────────────────────────────────────────────────
+    # - url: "https://hooks.slack.com/services/T000/B000/xxxx"
+    #   maxRetries: 3
+
+    # ── Internal ops webhook ─────────────────────────────────────────────────
+    # - url: "https://ops.example.com/warden-alerts"
+    #   secret: "${WARDEN_WEBHOOK_SECRET}"   # sent as X-Warden-Secret header
+    #   maxRetries: 5
