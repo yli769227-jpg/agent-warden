@@ -90,6 +90,7 @@ function printUsage(): void {
       `  ${pc.cyan('trending')}           Show which tools are rising or falling in call rate`,
       `  ${pc.cyan('anomaly-score')}      Compute a 0-100 risk score from recent audit behaviour`,
       `  ${pc.cyan('replay')}             Re-evaluate audit log entries against current policy`,
+      `  ${pc.cyan('ci-check')}           Run all CI safety checks and exit 1 if any fail`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -992,6 +993,227 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: ci-check ────────────────────────────────────────────────────────
+
+async function cmdCiCheck(flags: string[]): Promise<void> {
+  // Runs a battery of CI safety checks against the audit log and exits 1
+  // if ANY check fails. Designed for use in GitHub Actions / CI pipelines.
+  //
+  // Checks run:
+  //   1. Audit log exists and is non-empty
+  //   2. Deny rate in window is below threshold (default 50%)
+  //   3. No dangerous tool calls (delete/bash/exec/sudo/…)
+  //   4. Anomaly score below threshold (default 60)
+  //   5. No killed entries (kill switch fired)
+  //   6. If --baseline given: warden compare regression check
+  //
+  // Flags:
+  //   --window/-w <hours>        Window to analyse (default 1)
+  //   --max-deny-rate N          Max allowed deny rate 0-100 (default 50)
+  //   --max-score N              Max allowed anomaly score (default 60)
+  //   --allow-dangerous          Skip dangerous-tool check
+  //   --allow-killed             Skip kill-switch check
+  //   --baseline <snapshot.json> Path to baseline snapshot for regression check
+  //   --json/-j                  Machine-readable output
+
+  let windowHours   = 1;
+  let maxDenyRate   = 50;
+  let maxScore      = 60;
+  let allowDangerous = false;
+  let allowKilled   = false;
+  let baselinePath: string | undefined;
+  let jsonOutput    = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--window' || f === '-w') && flags[i + 1]) {
+      windowHours = parseFloat(flags[++i]!);
+    } else if (f === '--max-deny-rate' && flags[i + 1]) {
+      maxDenyRate = parseFloat(flags[++i]!);
+    } else if (f === '--max-score' && flags[i + 1]) {
+      maxScore = parseInt(flags[++i]!, 10);
+    } else if (f === '--allow-dangerous') {
+      allowDangerous = true;
+    } else if (f === '--allow-killed') {
+      allowKilled = true;
+    } else if (f === '--baseline' && flags[i + 1]) {
+      baselinePath = flags[++i];
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  const DANGEROUS = /delete|remove|bash|shell|exec|sudo|kill|rm|drop|truncate|format/i;
+  const logFile   = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+  const now       = Date.now();
+  const cutoff    = now - windowHours * 3_600_000;
+
+  type CheckResult = {
+    name:    string;
+    passed:  boolean;
+    detail:  string;
+  };
+
+  const checks: CheckResult[] = [];
+
+  // ── Check 1: Log exists and is non-empty ──────────────────────────────────
+  const logExists = fs.existsSync(logFile);
+  const logSize   = logExists ? fs.statSync(logFile).size : 0;
+  checks.push({
+    name:   'audit-log-exists',
+    passed: logExists && logSize > 0,
+    detail: logExists
+      ? logSize > 0 ? `exists (${logSize} bytes)` : 'exists but is empty'
+      : `not found: ${logFile}`,
+  });
+
+  // Only proceed with log checks if the file exists
+  let total          = 0;
+  let denied         = 0;
+  let killedCount    = 0;
+  let dangerousCalls = 0;
+
+  if (logExists && logSize > 0) {
+    const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      let entry: AuditEntry;
+      try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+      const ts = entry.ts ? new Date(entry.ts).getTime() : 0;
+      if (ts < cutoff) continue;
+
+      total++;
+      if (entry.verdict === 'deny')   denied++;
+      if (entry.verdict === 'killed') killedCount++;
+
+      const tool = entry.tool ?? '';
+      if (DANGEROUS.test(tool)) dangerousCalls++;
+    }
+  }
+
+  // ── Check 2: Deny rate ────────────────────────────────────────────────────
+  const denyRate = total > 0 ? Math.round((denied / total) * 100) : 0;
+  checks.push({
+    name:   'deny-rate',
+    passed: denyRate <= maxDenyRate,
+    detail: `deny rate = ${denyRate}%  (max allowed: ${maxDenyRate}%)`,
+  });
+
+  // ── Check 3: Dangerous tools ──────────────────────────────────────────────
+  if (!allowDangerous) {
+    checks.push({
+      name:   'no-dangerous-tools',
+      passed: dangerousCalls === 0,
+      detail: dangerousCalls === 0
+        ? 'no dangerous tool calls detected'
+        : `${dangerousCalls} dangerous tool call${dangerousCalls > 1 ? 's' : ''} (matches /delete|bash|exec|sudo|…/)`,
+    });
+  }
+
+  // ── Check 4: Anomaly score ────────────────────────────────────────────────
+  // Compute inline (simplified version of cmdAnomalyScore logic)
+  const toolCounts: Record<string, number> = {};
+  if (logExists && logSize > 0) {
+    const rs2 = fs.createReadStream(logFile, { encoding: 'utf8' });
+    const rl2 = readline.createInterface({ input: rs2, crlfDelay: Infinity });
+    for await (const line of rl2) {
+      if (!line.trim()) continue;
+      let entry: AuditEntry;
+      try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+      const ts = entry.ts ? new Date(entry.ts).getTime() : 0;
+      if (ts < cutoff) continue;
+      const tool = entry.tool ?? '(unknown)';
+      toolCounts[tool] = (toolCounts[tool] ?? 0) + 1;
+    }
+  }
+
+  const dangerRate  = total > 0 ? dangerousCalls / total : 0;
+  const maxCalls    = total > 0 ? Math.max(...Object.values(toolCounts)) : 0;
+  const burstRatio  = total > 0 ? maxCalls / total : 0;
+  const anomScore   = Math.min(100, Math.round(
+    Math.round((denied / Math.max(total, 1)) * 100) * 0.40 +
+    Math.min(100, Math.round(dangerRate * 150))      * 0.30 +
+    (burstRatio > 0.5 ? Math.round((burstRatio - 0.5) * 200) : 0) * 0.15,
+  ));
+
+  checks.push({
+    name:   'anomaly-score',
+    passed: anomScore <= maxScore,
+    detail: `score = ${anomScore}/100  (max allowed: ${maxScore})`,
+  });
+
+  // ── Check 5: No kill-switch events ───────────────────────────────────────
+  if (!allowKilled) {
+    checks.push({
+      name:   'no-kill-switch',
+      passed: killedCount === 0,
+      detail: killedCount === 0
+        ? 'no kill-switch events'
+        : `${killedCount} kill-switch event${killedCount > 1 ? 's' : ''} detected`,
+    });
+  }
+
+  // ── Check 6: Baseline regression (optional) ───────────────────────────────
+  if (baselinePath) {
+    let passed   = true;
+    let detail   = '';
+    if (!fs.existsSync(baselinePath)) {
+      passed = false;
+      detail = `baseline file not found: ${baselinePath}`;
+    } else {
+      try {
+        type SnapTotals = { denyRate: number };
+        type Snap = { totals: SnapTotals; topTools: Array<{ tool: string; deny: number; killed: number }> };
+        const baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf8')) as Snap;
+        const bDenyRate = baseline.totals.denyRate;
+        const delta     = denyRate - bDenyRate;
+        const baseBlocked = new Set(
+          baseline.topTools.filter(t => t.deny + t.killed > 0).map(t => t.tool),
+        );
+        const newlyBlocked = Object.keys(toolCounts).filter(t => {
+          return !baseBlocked.has(t) && (denied > 0);
+        });
+        passed = delta <= 5 && newlyBlocked.length === 0;
+        detail = passed
+          ? `deny rate delta: +${delta}pp — no regression`
+          : `regression: deny rate delta +${delta}pp, ${newlyBlocked.length} newly blocked tools`;
+      } catch {
+        passed = false;
+        detail = `failed to parse baseline: ${baselinePath}`;
+      }
+    }
+    checks.push({ name: 'baseline-regression', passed, detail });
+  }
+
+  // ── Output ─────────────────────────────────────────────────────────────────
+  const allPassed = checks.every(c => c.passed);
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({ passed: allPassed, checks }, null, 2));
+  } else {
+    console.log(`\n${pc.bold('warden ci-check')} — ${windowHours}h window\n`);
+    for (const check of checks) {
+      const icon = check.passed ? pc.green('✅') : pc.red('❌');
+      console.log(`  ${icon}  ${check.name.padEnd(25)} ${pc.dim(check.detail)}`);
+    }
+    console.log();
+    if (allPassed) {
+      console.log(pc.green('✅ All CI checks passed'));
+    } else {
+      const failures = checks.filter(c => !c.passed).map(c => c.name);
+      console.log(pc.red(`❌ CI check failed: ${failures.join(', ')}`));
+    }
+    console.log();
+  }
+
+  if (!allPassed) {
+    process.exit(1);
   }
 }
 
@@ -4024,6 +4246,10 @@ async function main(): Promise<void> {
 
     case 'replay':
       await cmdReplay(argv.slice(1));
+      break;
+
+    case 'ci-check':
+      await cmdCiCheck(argv.slice(1));
       break;
 
     default:
