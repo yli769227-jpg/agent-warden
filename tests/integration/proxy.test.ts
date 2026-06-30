@@ -422,3 +422,121 @@ describe('Multi-server proxy (servers map)', () => {
     }
   });
 });
+
+describe('Kill switch', () => {
+  test('9. Kill switch arm — tool calls return error immediately', async () => {
+    const dir           = makeTestDir('test9');
+    const logFile       = path.join(dir, 'audit.jsonl');
+    const ksFile        = path.join(dir, 'killswitch');
+
+    // Override the sentinel file path via environment variable
+    const configWithKs = {
+      ...singleServerConfig(logFile),
+      // We inject WARDEN_KILLSWITCH via the wrapper env below
+    };
+
+    // Write a wrapper that sets WARDEN_KILLSWITCH before importing runProxy
+    const wrapperPath = path.join(TEST_TMP, `ks-wrap-${Date.now()}.mjs`);
+    const configPath  = path.join(TEST_TMP, `ks-cfg-${Date.now()}.json`);
+    fs.writeFileSync(configPath, JSON.stringify(configWithKs));
+    fs.writeFileSync(wrapperPath, `
+process.env.WARDEN_KILLSWITCH = ${JSON.stringify(ksFile)};
+import { runProxy } from '${DIST_DIR}/proxy.js';
+import * as fs from 'node:fs';
+const config = JSON.parse(fs.readFileSync(${JSON.stringify(configPath)}, 'utf8'));
+await runProxy(config).catch(err => { process.stderr.write('ERR: ' + err.message); process.exit(1); });
+`);
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args:    [wrapperPath],
+      stderr:  'inherit',
+    });
+    const client = new Client({ name: 'ks-test', version: '0.1.0' }, { capabilities: {} });
+    await client.connect(transport);
+    await delay(400);
+
+    try {
+      // 1. Before arming — should pass through
+      const before = await client.callTool({ name: 'echo_tool', arguments: { message: 'pre-kill' } });
+      const beforeContent = (before as { content: Array<{ text: string }> }).content;
+      expect(beforeContent[0]?.text).toBe('pre-kill');
+
+      // 2. Arm the kill switch by creating the sentinel file
+      fs.mkdirSync(path.dirname(ksFile), { recursive: true });
+      fs.writeFileSync(ksFile, JSON.stringify({ reason: 'test arm', since: new Date().toISOString() }));
+      await delay(700); // give the watcher time to react
+
+      // 3. After arming — should be blocked
+      const after = await client.callTool({ name: 'echo_tool', arguments: { message: 'post-kill' } });
+      expect((after as { isError?: boolean }).isError).toBe(true);
+      const afterText = (after as { content: Array<{ text: string }> }).content[0]?.text ?? '';
+      expect(afterText).toMatch(/kill switch/i);
+
+      // 4. Audit log has "killed" verdict
+      await delay(100);
+      if (fs.existsSync(logFile)) {
+        const entries = fs.readFileSync(logFile, 'utf8')
+          .trim().split('\n').filter(Boolean)
+          .map(l => JSON.parse(l) as { verdict: string });
+        const killedEntries = entries.filter(e => e.verdict === 'killed');
+        expect(killedEntries.length).toBeGreaterThanOrEqual(1);
+      }
+    } finally {
+      try { await client.close(); } catch {}
+      fs.rmSync(wrapperPath, { force: true });
+      fs.rmSync(configPath, { force: true });
+      await delay(100);
+    }
+  });
+
+  test('10. Kill switch disarm — tool calls resume after sentinel removed', async () => {
+    const dir     = makeTestDir('test10');
+    const logFile = path.join(dir, 'audit.jsonl');
+    const ksFile  = path.join(dir, 'killswitch');
+
+    // Pre-arm: create sentinel before proxy starts
+    fs.mkdirSync(path.dirname(ksFile), { recursive: true });
+    fs.writeFileSync(ksFile, JSON.stringify({ reason: 'pre-armed', since: new Date().toISOString() }));
+
+    const wrapperPath = path.join(TEST_TMP, `ks-disarm-wrap-${Date.now()}.mjs`);
+    const configPath  = path.join(TEST_TMP, `ks-disarm-cfg-${Date.now()}.json`);
+    fs.writeFileSync(configPath, JSON.stringify(singleServerConfig(logFile)));
+    fs.writeFileSync(wrapperPath, `
+process.env.WARDEN_KILLSWITCH = ${JSON.stringify(ksFile)};
+import { runProxy } from '${DIST_DIR}/proxy.js';
+import * as fs from 'node:fs';
+const config = JSON.parse(fs.readFileSync(${JSON.stringify(configPath)}, 'utf8'));
+await runProxy(config).catch(err => { process.stderr.write('ERR: ' + err.message); process.exit(1); });
+`);
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args:    [wrapperPath],
+      stderr:  'inherit',
+    });
+    const client = new Client({ name: 'ks-disarm-test', version: '0.1.0' }, { capabilities: {} });
+    await client.connect(transport);
+    await delay(400);
+
+    try {
+      // 1. Starts killed — calls blocked
+      const blocked = await client.callTool({ name: 'echo_tool', arguments: { message: 'blocked' } });
+      expect((blocked as { isError?: boolean }).isError).toBe(true);
+
+      // 2. Disarm: remove sentinel
+      fs.unlinkSync(ksFile);
+      await delay(700);
+
+      // 3. Now calls pass through
+      const passed = await client.callTool({ name: 'echo_tool', arguments: { message: 'resumed' } });
+      const content = (passed as { content: Array<{ text: string }> }).content;
+      expect(content[0]?.text).toBe('resumed');
+    } finally {
+      try { await client.close(); } catch {}
+      fs.rmSync(wrapperPath, { force: true });
+      fs.rmSync(configPath, { force: true });
+      await delay(100);
+    }
+  });
+});
