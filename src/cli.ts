@@ -83,6 +83,7 @@ function printUsage(): void {
       `  ${pc.cyan('config-gen')}        Scan Claude Desktop / Claude Code config and generate warden.config.yaml`,
       `  ${pc.cyan('server-list')}        Connect to all configured servers and list available tools`,
       `  ${pc.cyan('timeline')}           ASCII timeline of tool calls grouped by time bucket`,
+      `  ${pc.cyan('doctor')}             Full health check of warden installation and config`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -985,6 +986,175 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: doctor ──────────────────────────────────────────────────────────
+
+async function cmdDoctor(flags: string[]): Promise<void> {
+  // Comprehensive health check for warden installation and config.
+  // Does NOT make network connections — purely local checks.
+
+  let configArg: string | undefined;
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--config' || f === '-c') && flags[i + 1]) {
+      configArg = flags[++i];
+    }
+  }
+
+  console.log(`${pc.bold('agent-warden doctor')} — running health checks\n`);
+
+  type CheckResult = { label: string; ok: boolean; detail: string; hint?: string };
+  const checks: CheckResult[] = [];
+
+  function pass(label: string, detail: string): void {
+    checks.push({ label, ok: true, detail });
+  }
+  function fail(label: string, detail: string, hint?: string): void {
+    checks.push({ label, ok: false, detail, hint });
+  }
+  function warn(label: string, detail: string, hint?: string): void {
+    checks.push({ label, ok: true, detail, hint }); // warn treated as pass but with hint
+  }
+
+  // ── 1. Node.js version ────────────────────────────────────────────────────
+  const nodeVer = process.versions.node;
+  const [nodeMajor] = nodeVer.split('.').map(Number);
+  if ((nodeMajor ?? 0) >= 18) {
+    pass('Node.js version', `v${nodeVer}`);
+  } else {
+    fail('Node.js version', `v${nodeVer}`, 'agent-warden requires Node.js 18 or later');
+  }
+
+  // ── 2. warden binary is runnable ──────────────────────────────────────────
+  pass('warden binary', `v${VERSION} (${process.argv[1] ?? 'unknown path'})`);
+
+  // ── 3. Config file ────────────────────────────────────────────────────────
+  const { resolveConfigPath } = await import('./config.js');
+  const cfgPath = configArg ? (await import('node:path')).resolve(configArg) : resolveConfigPath();
+
+  if (fs.existsSync(cfgPath)) {
+    pass('Config file exists', cfgPath);
+
+    // Validate the config
+    const { load: yamlLoad } = await import('js-yaml');
+    let rawContent: string;
+    try {
+      rawContent = fs.readFileSync(cfgPath, 'utf8');
+      try {
+        const parsed = yamlLoad(rawContent) as Record<string, unknown>;
+        const issues = validateConfigObject(parsed ?? {});
+        const errs = issues.filter(i => i.level === 'error');
+        const warns = issues.filter(i => i.level === 'warning');
+
+        if (errs.length > 0) {
+          fail('Config validation', `${errs.length} error${errs.length > 1 ? 's' : ''}`,
+            errs.map(e => `${e.path}: ${e.msg}`).join('; '));
+        } else if (warns.length > 0) {
+          warn('Config validation', `valid (${warns.length} warning${warns.length > 1 ? 's' : ''})`,
+            warns.map(w => `${w.path}: ${w.msg}`).join('; '));
+        } else {
+          pass('Config validation', 'no issues');
+        }
+
+        // Check mode
+        const mode = String(parsed?.['mode'] ?? 'audit');
+        if (mode === 'audit') {
+          warn('Mode', '"audit" — tool calls are logged but not blocked',
+            'Switch to "enforce" to actually block denied tool calls');
+        } else {
+          pass('Mode', `"${mode}"`);
+        }
+      } catch {
+        fail('Config validation', 'YAML parse error', `Run: warden validate ${cfgPath}`);
+      }
+    } catch {
+      fail('Config readable', `Cannot read ${cfgPath}`, 'Check file permissions');
+    }
+  } else {
+    fail('Config file exists', `Not found at ${cfgPath}`,
+      'Run: warden init  (or: warden config-gen)');
+  }
+
+  // ── 4. Kill switch state ──────────────────────────────────────────────────
+  const ks = new KillSwitch();
+  const ksState = ks.getState();
+  if (ksState.killed) {
+    warn('Kill switch', `ARMED — all tool calls will be blocked`,
+      `Run: warden unkill   (reason: ${ksState.reason ?? '(none)'})`);
+  } else {
+    pass('Kill switch', 'disarmed (normal operation)');
+  }
+
+  // ── 5. Audit log ──────────────────────────────────────────────────────────
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+  const logDir  = path.dirname(logFile);
+
+  if (fs.existsSync(logFile)) {
+    const stat = fs.statSync(logFile);
+    const sizeMiB = (stat.size / (1024 * 1024)).toFixed(1);
+    pass('Audit log', `${logFile} (${sizeMiB} MiB)`);
+  } else if (fs.existsSync(logDir)) {
+    warn('Audit log', `not yet created at ${logFile}`,
+      'Will be created when warden first runs');
+  } else {
+    warn('Audit log directory', `${logDir} does not exist`,
+      `Will be created at first run (mkdir ${logDir})`);
+  }
+
+  // ── 6. Claude Desktop / Code integration ──────────────────────────────────
+  const claudeFound = findClaudeConfigs();
+  if (claudeFound.length > 0) {
+    let wardenCount = 0;
+    for (const { path: cfgFilePath } of claudeFound) {
+      try {
+        const c = JSON.parse(fs.readFileSync(cfgFilePath, 'utf8')) as Record<string, unknown>;
+        const servers = c['mcpServers'] as Record<string, unknown> | undefined;
+        if (servers) {
+          for (const def of Object.values(servers)) {
+            const d = def as Record<string, unknown>;
+            if (d['command'] === 'warden') wardenCount++;
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    if (wardenCount > 0) {
+      pass('Claude integration', `${wardenCount} server${wardenCount > 1 ? 's' : ''} proxied by warden`);
+    } else {
+      warn('Claude integration', 'warden not yet injected into Claude config',
+        'Run: warden install  to auto-inject warden in front of your MCP servers');
+    }
+  } else {
+    warn('Claude config', 'no Claude Desktop or Claude Code config found', '');
+  }
+
+  // ── Render results ────────────────────────────────────────────────────────
+  console.log();
+  let failCount = 0;
+  let warnCount = 0;
+
+  for (const c of checks) {
+    const errs    = c.ok && !c.hint ? pc.green('✅') : c.ok && c.hint ? pc.yellow('⚠️ ') : pc.red('❌');
+    const label   = c.label.padEnd(28);
+    const detail  = c.detail;
+    console.log(`  ${errs} ${pc.bold(label)} ${detail}`);
+    if (c.hint) {
+      console.log(`       ${pc.dim(c.hint)}`);
+    }
+    if (!c.ok) failCount++;
+    else if (c.hint) warnCount++;
+  }
+
+  console.log();
+  if (failCount > 0) {
+    console.log(pc.red(`${failCount} issue${failCount > 1 ? 's' : ''} found — fix before running warden`));
+    process.exit(1);
+  } else if (warnCount > 0) {
+    console.log(pc.yellow(`${warnCount} suggestion${warnCount > 1 ? 's' : ''} — warden should work but see hints above`));
+  } else {
+    console.log(pc.green('✅ All checks passed — warden is healthy'));
   }
 }
 
@@ -2892,6 +3062,10 @@ async function main(): Promise<void> {
 
     case 'timeline':
       await cmdTimeline(argv.slice(1));
+      break;
+
+    case 'doctor':
+      await cmdDoctor(argv.slice(1));
       break;
 
     default:
