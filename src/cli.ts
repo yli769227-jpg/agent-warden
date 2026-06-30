@@ -42,7 +42,7 @@ function printUsage(): void {
       `  ${pc.cyan('run [config]')}      Start the warden proxy (reads config file)`,
       `  ${pc.cyan('kill [reason]')}     Arm the kill switch — all tool calls denied`,
       `  ${pc.cyan('unkill')}            Disarm the kill switch`,
-      `  ${pc.cyan('log')}               Tail the audit log (--tool, --verdict, --since, --no-follow, --json)`,
+      `  ${pc.cyan('log')}               Tail the audit log (--tool, --verdict, --since, --tail N, --no-follow, --json)`,
       `  ${pc.cyan('stats')}             Show audit statistics (--since, --json for machine output)`,
       `  ${pc.cyan('check [config]')}    Verify config and downstream server reachability`,
       `  ${pc.cyan('init')}              Write a starter warden.config.yaml in the current directory`,
@@ -154,6 +154,7 @@ interface LogFilter {
   since?: Date;
   follow: boolean;
   json: boolean;   // emit raw JSON instead of human-readable output
+  tail?: number;   // show only the last N matching entries before follow
 }
 
 /** Parses `--since` values: "1h", "30m", "2d", or an ISO-8601 timestamp. */
@@ -202,7 +203,7 @@ function printLogLine(line: string, filter: LogFilter): void {
 }
 
 async function cmdLog(flags: string[]): Promise<void> {
-  // Parse flags: --tool, --verdict, --since, --no-follow, --json
+  // Parse flags: --tool, --verdict, --since, --no-follow, --json, --tail N
   const filter: LogFilter = { follow: true, json: false };
 
   for (let i = 0; i < flags.length; i++) {
@@ -217,6 +218,9 @@ async function cmdLog(flags: string[]): Promise<void> {
       filter.verdict = flags[++i];
     } else if ((f === '--since' || f === '-s') && flags[i + 1]) {
       filter.since = parseSince(flags[++i]!);
+    } else if ((f === '--tail' || f === '-N') && flags[i + 1]) {
+      const n = parseInt(flags[++i]!, 10);
+      if (!isNaN(n) && n > 0) filter.tail = n;
     }
   }
 
@@ -232,12 +236,25 @@ async function cmdLog(flags: string[]): Promise<void> {
 
   await waitForFile(logFile);
 
-  // ── Print existing content ─────────────────────────────────────────────────
-  const readStream = fs.createReadStream(logFile, { encoding: 'utf8' });
-  const rl = readline.createInterface({ input: readStream, crlfDelay: Infinity });
-
-  for await (const line of rl) {
-    printLogLine(line, filter);
+  // ── Print existing content (or last N lines when --tail N is set) ──────────
+  if (filter.tail != null) {
+    // Collect all matching lines then print the last N
+    const allLines: string[] = [];
+    const scanStream = fs.createReadStream(logFile, { encoding: 'utf8' });
+    const scanRl     = readline.createInterface({ input: scanStream, crlfDelay: Infinity });
+    for await (const line of scanRl) {
+      if (entryMatchesFilter(line, filter)) allLines.push(line);
+    }
+    const startIdx = Math.max(0, allLines.length - filter.tail);
+    for (const line of allLines.slice(startIdx)) {
+      printLogLine(line, filter);
+    }
+  } else {
+    const readStream = fs.createReadStream(logFile, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input: readStream, crlfDelay: Infinity });
+    for await (const line of rl) {
+      printLogLine(line, filter);
+    }
   }
 
   if (!filter.follow) return;
