@@ -89,6 +89,7 @@ function printUsage(): void {
       `  ${pc.cyan('compare')}            Compare two snapshot files and show regressions`,
       `  ${pc.cyan('trending')}           Show which tools are rising or falling in call rate`,
       `  ${pc.cyan('anomaly-score')}      Compute a 0-100 risk score from recent audit behaviour`,
+      `  ${pc.cyan('replay')}             Re-evaluate audit log entries against current policy`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -992,6 +993,167 @@ async function cmdRotate(flags: string[]): Promise<void> {
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
   }
+}
+
+// ─── Command: replay ──────────────────────────────────────────────────────────
+
+async function cmdReplay(flags: string[]): Promise<void> {
+  // Re-evaluates historical audit log entries against a (possibly new) policy.
+  // Shows how the CURRENT policy would have treated HISTORICAL calls —
+  // useful for validating policy changes before deploying them.
+  //
+  // Flags:
+  //   --config/-c <path>    Policy config to evaluate against
+  //   --since/-s <expr>     Only replay entries since this date
+  //   --json/-j             Machine-readable diff output
+  //   --diff-only           Only show entries where NEW verdict ≠ ORIGINAL verdict
+  //   --limit N             Max entries to replay (default 500)
+
+  let configArg: string | undefined;
+  let sinceDate: Date | undefined;
+  let jsonOutput = false;
+  let diffOnly   = false;
+  let limit      = 500;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--config' || f === '-c') && flags[i + 1]) {
+      configArg = flags[++i];
+    } else if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate = parseSince(flags[++i]!);
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if (f === '--diff-only') {
+      diffOnly = true;
+    } else if (f === '--limit' && flags[i + 1]) {
+      limit = parseInt(flags[++i]!, 10);
+    }
+  }
+
+  // Load config
+  const origStderr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = () => true;
+  let config: ReturnType<typeof loadConfig>;
+  try {
+    config = loadConfig(configArg);
+  } catch (err) {
+    process.stderr.write = origStderr;
+    console.error(pc.red(`Config error: ${(err as Error).message}`));
+    process.exit(1);
+    return;
+  }
+  process.stderr.write = origStderr;
+
+  const { createPolicyEngine } = await import('./policy.js');
+  const policyConfig = { ...config.policy, mode: config.mode };
+  const engine = createPolicyEngine(policyConfig);
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Replay entries ─────────────────────────────────────────────────────────
+  type ReplayResult = {
+    ts:              string;
+    tool:            string;
+    originalVerdict: string;
+    newVerdict:      string;
+    changed:         boolean;
+    reason?:         string;
+  };
+
+  const results: ReplayResult[] = [];
+  let replayedTotal = 0;
+  let changedCount  = 0;
+
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  for await (const line of rl) {
+    if (replayedTotal >= limit) break;
+    if (!line.trim()) continue;
+
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (sinceDate && entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    const tool    = entry.tool ?? '(unknown)';
+    const args    = entry.args ?? {};
+    const origV   = entry.verdict ?? 'unknown';
+
+    // Re-evaluate with current policy
+    process.stderr.write = () => true;
+    const decision = engine.evaluate(tool, args);
+    process.stderr.write = origStderr;
+
+    const newV =
+      config.mode === 'enforce' && decision.action === 'deny' ? 'deny' : 'allow';
+
+    // If original was 'killed' (kill switch), we keep that as-is in the original column
+    const changed = origV !== newV && !(origV === 'killed' && newV === 'deny');
+
+    const result: ReplayResult = {
+      ts:              entry.ts ?? '',
+      tool,
+      originalVerdict: origV,
+      newVerdict:      newV,
+      changed,
+      ...(decision.reason ? { reason: decision.reason } : {}),
+    };
+
+    replayedTotal++;
+    if (changed) changedCount++;
+
+    if (!diffOnly || changed) {
+      results.push(result);
+    }
+  }
+
+  // ── Output ─────────────────────────────────────────────────────────────────
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      replayedTotal,
+      changedCount,
+      results,
+    }, null, 2));
+    return;
+  }
+
+  console.log(`\n${pc.bold('warden replay')} — re-evaluating ${replayedTotal} entries against current policy\n`);
+
+  if (changedCount === 0) {
+    console.log(pc.green('✅ No verdict changes — current policy matches original behaviour'));
+    console.log();
+    return;
+  }
+
+  console.log(pc.yellow(`⚠️  ${changedCount} verdict change${changedCount > 1 ? 's' : ''} detected:\n`));
+
+  for (const r of results) {
+    if (!r.changed && diffOnly) continue;
+    const origLabel =
+      r.originalVerdict === 'allow'  ? pc.green(r.originalVerdict.padEnd(7))  :
+      r.originalVerdict === 'deny'   ? pc.red(r.originalVerdict.padEnd(7))    :
+      r.originalVerdict === 'killed' ? pc.bgRed(pc.white('killed '))           :
+      pc.dim(r.originalVerdict.padEnd(7));
+
+    const newLabel =
+      r.newVerdict === 'allow' ? pc.green(r.newVerdict.padEnd(7)) :
+      r.newVerdict === 'deny'  ? pc.red(r.newVerdict.padEnd(7))   :
+      pc.dim(r.newVerdict.padEnd(7));
+
+    const arrow = r.changed ? pc.yellow('→') : pc.dim('=');
+    const mark  = r.changed ? pc.yellow('!') : ' ';
+    console.log(` ${mark} ${pc.dim(r.ts.slice(0, 19))} ${pc.bold(r.tool.padEnd(35))} ${origLabel} ${arrow} ${newLabel}${r.reason ? pc.dim(` (${r.reason})`) : ''}`);
+  }
+
+  console.log();
+  console.log(pc.dim(`Total replayed: ${replayedTotal}  Changed: ${changedCount}`));
+  console.log();
 }
 
 // ─── Command: anomaly-score ───────────────────────────────────────────────────
@@ -3858,6 +4020,10 @@ async function main(): Promise<void> {
     case 'anomaly-score':
     case 'score':
       await cmdAnomalyScore(argv.slice(1));
+      break;
+
+    case 'replay':
+      await cmdReplay(argv.slice(1));
       break;
 
     default:
