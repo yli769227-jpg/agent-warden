@@ -397,6 +397,7 @@ export async function runProxy(config: WardenConfig): Promise<void> {
         scrubber: {
           enabled: config.scrubber.enabled,
         },
+        sessionStats: audit.getStats(),
       };
 
       return {

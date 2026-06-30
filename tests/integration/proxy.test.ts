@@ -667,6 +667,7 @@ describe('Built-in warden_status tool', () => {
         killSwitch: { active: boolean };
         servers: string[];
         policy: { defaultAction: string };
+        sessionStats: { total: number; allowed: number; denied: number; killed: number };
       };
 
       expect(status.version).toBe('0.1.0');
@@ -674,6 +675,11 @@ describe('Built-in warden_status tool', () => {
       expect(status.killSwitch.active).toBe(false);
       expect(status.servers).toContain('_default');
       expect(status.policy.defaultAction).toBe('allow');
+      // sessionStats exists and counts are non-negative integers
+      expect(typeof status.sessionStats.total).toBe('number');
+      expect(status.sessionStats.total).toBeGreaterThanOrEqual(0);
+      expect(status.sessionStats.allowed + status.sessionStats.denied + status.sessionStats.killed)
+        .toBe(status.sessionStats.total);
     } finally {
       await cleanup();
     }
