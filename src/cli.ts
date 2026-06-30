@@ -403,30 +403,40 @@ mode: audit
 # Path to the JSONL audit log.  Supports ~/ home expansion.
 logFile: ~/.warden/audit.jsonl
 
-# The downstream MCP server to proxy.  Supply the full command + arguments as
-# a YAML sequence — the first item is the executable, the rest are argv.
-downstreamCommand:
-  - npx
-  - -y
-  - "@modelcontextprotocol/server-filesystem"
-  - /path/to/allowed/directory
+# Downstream MCP servers Warden proxies to.
+# Tool names are prefixed: "filesystem/read_file", "github/create_issue".
+# Add as many servers as you need — Warden fans out to all of them.
+servers:
+  filesystem:
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-filesystem"
+      - /path/to/allowed/directory
+
+  # Uncomment to add a GitHub MCP server:
+  # github:
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-github"]
+  #   env:
+  #     GITHUB_TOKEN: "\${GITHUB_TOKEN}"
 
 policy:
   # Fallback verdict when no rule matches the tool name.
   defaultAction: allow
 
   # Ordered rules — first match wins.
-  # 'tool' accepts an exact name or a minimatch glob (e.g. "fs/*", "*").
+  # 'tool' accepts an exact name or a glob (e.g. "filesystem/*", "*delete*").
   rules:
-    - tool: "fs/write"
+    - tool: "filesystem/write_file"
       action: deny
       reason: "Filesystem writes require explicit approval"
 
-    - tool: "fs/read"
+    - tool: "filesystem/read_file"
       action: allow
 
-    # Uncomment to disable shell access entirely:
-    # - tool: "bash"
+    # Uncomment to block all shell access:
+    # - tool: "*bash*"
     #   action: deny
     #   reason: "Shell access disabled"
 

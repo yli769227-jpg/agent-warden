@@ -46,26 +46,50 @@ logFile: ~/.warden/audit.jsonl   # absolute path is also fine: /var/log/warden/a
 
 
 # ---------------------------------------------------------------------------
-# downstreamCommand  (REQUIRED — warden throws a descriptive error if absent)
+# servers  (REQUIRED — either this or the legacy downstreamCommand must be set)
 #
-# The MCP server that warden proxies.  Provide the full command as a YAML
-# sequence: first item is the executable, remaining items are argv.
+# Named downstream MCP servers that warden proxies.  Each key becomes a
+# namespace prefix on tool names: server key "filesystem" → tools are
+# exposed as "filesystem/read_file", "filesystem/write_file", etc.
 #
-# The example below wraps the official @modelcontextprotocol/server-filesystem
-# package.  The final argument is the root directory the server is allowed to
-# read/write.  Pass multiple allowed paths as additional items.
+# Add as many servers as you need.  Warden connects to all of them at
+# startup and merges their tool namespaces.
+#
+# Each server entry has:
+#   command  — Executable to spawn (required).
+#   args     — List of arguments (optional, default []).
+#   env      — Extra environment variables merged into the child's env (optional).
+#              Use ${VAR} syntax; values are resolved from the parent environment.
 #
 # Tips:
-#   • Use `npx -y` so the package is auto-installed if not already cached.
-#   • Pass an absolute path for the allowed root to avoid cwd-relative
-#     ambiguity.
-#   • For a locally built server use ["node", "dist/index.js"] instead.
+#   • Use `npx -y` so packages auto-install if not already cached.
+#   • Absolute paths in args avoid cwd-relative ambiguity.
+#   • For locally built servers use command: node, args: ["dist/index.js"].
 # ---------------------------------------------------------------------------
-downstreamCommand:
-  - npx
-  - -y
-  - "@modelcontextprotocol/server-filesystem"
-  - /Users/alice/projects/my-app    # root the server is allowed to access
+servers:
+
+  # ── Official @modelcontextprotocol/server-filesystem ─────────────────────
+  filesystem:
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-filesystem"
+      - /Users/alice/projects/my-app    # root directory the server may access
+
+  # ── GitHub MCP server (official) ─────────────────────────────────────────
+  # github:
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - "@modelcontextprotocol/server-github"
+  #   env:
+  #     GITHUB_TOKEN: "${GITHUB_TOKEN}"   # resolved from parent environment
+
+  # ── Custom local server ───────────────────────────────────────────────────
+  # myserver:
+  #   command: node
+  #   args:
+  #     - /Users/alice/my-mcp-server/dist/index.js
 
 
 # ---------------------------------------------------------------------------
@@ -79,86 +103,77 @@ downstreamCommand:
 #   2. Built-in dangerous patterns (keyword match on tool name, or filesystem
 #      write targeting a path outside the process cwd)
 #   3. defaultAction fall-through
+#
+# With multiple servers, use the server prefix in tool names:
+#   "filesystem/write_file"   — matches only the filesystem server's write_file
+#   "filesystem/*"            — matches all filesystem tools
+#   "*delete*"                — matches any tool on any server with "delete" in name
 # ---------------------------------------------------------------------------
 policy:
 
   # defaultAction  ("allow" | "deny")
   #
-  # The verdict applied when no explicit rule matches and the built-in
-  # dangerous-pattern checks do not trigger.
-  #
-  # "allow"  — permissive default; useful when you want to deny only a known
-  #            bad set of tools (denylist approach).
-  # "deny"   — strict default; every tool must be explicitly allowed
-  #            (allowlist approach).
-  #
-  # For a filesystem proxy serving read-only workflows, "allow" with explicit
-  # deny rules for write tools is a reasonable starting point.
+  # "allow"  — permissive default; deny only a known set of tools (denylist).
+  # "deny"   — strict default; every tool must be explicitly allowed (allowlist).
   defaultAction: allow
 
   # rules  (ordered list; first match wins)
   #
-  # Each rule has three fields:
-  #   tool    — Exact tool name OR a minimatch-style glob.  The only wildcard
-  #             supported is "*" (matches zero or more characters).  Match is
-  #             case-sensitive.
+  #   tool    — Exact name or glob ("*" matches any characters, case-sensitive).
+  #             Include the server prefix for server-specific rules.
   #   action  — "allow" | "deny"
-  #   reason  — Optional human-readable string recorded in every audit entry
-  #             that this rule produces.  Helpful for post-hoc analysis.
+  #   reason  — Optional note recorded in every matching audit entry.
   rules:
 
-    # ── Explicit allow: safe read-only filesystem tools ───────────────────────
-    - tool: read_file
+    # ── Read-only filesystem access: always allow ─────────────────────────────
+    - tool: "filesystem/read_file"
       action: allow
-      reason: "Read access is always permitted for this project"
+      reason: "Read access is always permitted"
 
-    - tool: list_directory
+    - tool: "filesystem/list_directory"
       action: allow
-      reason: "Directory listing is safe and read-only"
 
-    - tool: get_file_info
+    - tool: "filesystem/search_files"
       action: allow
-      reason: "Metadata queries carry no side effects"
 
-    - tool: search_files
+    # ── Destructive filesystem ops: deny ──────────────────────────────────────
+    - tool: "filesystem/write_file"
+      action: deny
+      reason: "Filesystem writes require explicit human approval"
+
+    - tool: "filesystem/delete_file"
+      action: deny
+      reason: "Deletion is irreversible"
+
+    - tool: "filesystem/move_file"
+      action: deny
+      reason: "Move can cause irreversible data loss"
+
+    # ── GitHub: allow read, deny mutations ────────────────────────────────────
+    - tool: "github/get_*"
       action: allow
-      reason: "Search is read-only"
 
-    # ── Explicit deny: dangerous write / destructive tools ────────────────────
-    - tool: write_file
-      action: deny
-      reason: "Filesystem writes require explicit human approval — use the editor instead"
+    - tool: "github/list_*"
+      action: allow
 
-    - tool: create_directory
-      action: deny
-      reason: "Directory creation must be reviewed before execution"
+    - tool: "github/search_*"
+      action: allow
 
-    - tool: move_file
+    - tool: "github/create_*"
       action: deny
-      reason: "Move operations can cause irreversible data loss"
+      reason: "GitHub writes require explicit review"
 
-    - tool: delete_file
+    - tool: "github/push_*"
       action: deny
-      reason: "Deletion is irreversible — blocked unconditionally"
+      reason: "Push operations require explicit review"
 
-    # ── Explicit deny: shell / code execution ─────────────────────────────────
-    - tool: bash
+    # ── Catch-all: any tool containing "delete" or "destroy" ─────────────────
+    - tool: "*delete*"
       action: deny
-      reason: "Arbitrary shell access is disabled in production"
+      reason: "Deletion requires explicit policy exception"
 
-    - tool: execute_command
+    - tool: "*destroy*"
       action: deny
-      reason: "Command execution requires an explicit policy exception"
-
-    # ── Glob deny: any tool whose name ends with _write ───────────────────────
-    - tool: "*_write"
-      action: deny
-      reason: "Catch-all for any MCP server that names write tools with _write suffix"
-
-    # ── Glob deny: any tool whose name starts with admin_ ─────────────────────
-    - tool: "admin_*"
-      action: deny
-      reason: "Administrative tools are never permitted from an automated agent"
 
 
 # ---------------------------------------------------------------------------
