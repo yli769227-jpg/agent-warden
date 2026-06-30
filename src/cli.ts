@@ -71,6 +71,7 @@ function printUsage(): void {
       `  ${pc.cyan('rotate')}            Manually rotate the audit log (--no-compress, --list)`,
       `  ${pc.cyan('diff')}              Compare before/after stats around a split point (--split, --window, --json)`,
       `  ${pc.cyan('top')}               Live top-N tools by call count, refreshed every N seconds`,
+      `  ${pc.cyan('policy-check')}      Dry-run a tool call through the policy engine without proxying`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -924,6 +925,109 @@ async function cmdRotate(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: policy-check ────────────────────────────────────────────────────
+
+async function cmdPolicyCheck(flags: string[]): Promise<void> {
+  // Usage: warden policy-check <toolName> [--args '{...}'] [--config <path>] [--json]
+  // Evaluates the policy engine for a given tool + args and prints the decision.
+
+  let toolName   = '';
+  let argsJson   = '{}';
+  let configArg: string | undefined;
+  let jsonOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if ((f === '--args' || f === '-a') && flags[i + 1]) {
+      argsJson = flags[++i]!;
+    } else if ((f === '--config' || f === '-c') && flags[i + 1]) {
+      configArg = flags[++i];
+    } else if (!f.startsWith('-')) {
+      toolName = f;
+    }
+  }
+
+  if (!toolName) {
+    console.error(pc.red('Usage: warden policy-check <toolName> [--args \'{"key":"val"}\'] [--config path] [--json]'));
+    process.exit(1);
+  }
+
+  let parsedArgs: unknown;
+  try {
+    parsedArgs = JSON.parse(argsJson);
+  } catch {
+    console.error(pc.red(`Invalid --args JSON: ${argsJson}`));
+    process.exit(1);
+  }
+
+  // Load config (suppressing the debug log line)
+  const origStderr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = () => true;
+  let config: ReturnType<typeof loadConfig>;
+  try {
+    config = loadConfig(configArg);
+  } catch (err) {
+    process.stderr.write = origStderr;
+    console.error(pc.red(`Config error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+  process.stderr.write = origStderr;
+
+  const { createPolicyEngine } = await import('./policy.js');
+  const { createScrubberFromConfig } = await import('./scrubber.js');
+
+  const policyConfig = { ...config.policy, mode: config.mode };
+  const engine   = createPolicyEngine(policyConfig);
+  const scrub    = createScrubberFromConfig(config.scrubber);
+
+  process.stderr.write = () => true;
+  const decision     = engine.evaluate(toolName, parsedArgs);
+  const scrubbedArgs = config.scrubber.enabled ? scrub(parsedArgs) : parsedArgs;
+  process.stderr.write = origStderr;
+
+  const verdict =
+    config.mode === 'enforce' && decision.action === 'deny'
+      ? 'deny'
+      : 'allow';
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      tool:         toolName,
+      args:         parsedArgs,
+      scrubbedArgs,
+      mode:         config.mode,
+      action:      decision.action,
+      verdict,
+      reason:      decision.reason,
+      isDangerous: decision.isDangerous,
+    }, null, 2));
+    return;
+  }
+
+  const verdictLabel =
+    verdict === 'allow'
+      ? pc.green('ALLOW')
+      : pc.red('DENY');
+
+  console.log(`\n${pc.bold('Policy dry-run')}  tool: ${pc.cyan(toolName)}  mode: ${config.mode}`);
+  console.log(`\n  Verdict       ${verdictLabel}`);
+  if (decision.reason) {
+    console.log(`  Reason        ${decision.reason}`);
+  }
+  if (decision.isDangerous) {
+    console.log(`  ${pc.yellow('⚠️')}  Tool matched a dangerous-pattern heuristic`);
+  }
+  if (config.scrubber.enabled) {
+    const hasSecrets = JSON.stringify(parsedArgs) !== JSON.stringify(scrubbedArgs);
+    if (hasSecrets) {
+      console.log(`  ${pc.dim('Secrets detected in args — would be redacted in audit log')}`);
+    }
+  }
+  console.log();
+}
+
 // ─── Command: top ─────────────────────────────────────────────────────────────
 
 async function cmdTop(flags: string[]): Promise<void> {
@@ -1277,6 +1381,11 @@ async function main(): Promise<void> {
 
     case 'top':
       await cmdTop(argv.slice(1));
+      break;
+
+    case 'policy-check':
+    case 'policy':
+      await cmdPolicyCheck(argv.slice(1));
       break;
 
     default:
