@@ -67,6 +67,7 @@ function printUsage(): void {
       `  ${pc.cyan('init')}              Write a starter warden.config.yaml in the current directory`,
       `  ${pc.cyan('version')}           Print version and exit`,
       `  ${pc.cyan('export [config]')}   Export audit log to CSV (--output, --since, --tool, --verdict)`,
+      `  ${pc.cyan('bench')}             Measure per-call policy+scrubber overhead (--iterations N, --json)`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -742,6 +743,116 @@ async function cmdExport(flags: string[]): Promise<void> {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
+// ─── Command: bench ───────────────────────────────────────────────────────────
+
+async function cmdBench(flags: string[]): Promise<void> {
+  // Flags: --iterations N (default 50), --tool <name> (default "warden/ping"),
+  //        --json (machine output), --config <path>
+  let iterations = 50;
+  let toolName   = '__warden_bench__';
+  let jsonOutput = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--iterations' || f === '-i') && flags[i + 1]) {
+      const n = parseInt(flags[++i]!, 10);
+      if (!isNaN(n) && n > 0) iterations = n;
+    } else if ((f === '--tool' || f === '-t') && flags[i + 1]) {
+      toolName = flags[++i]!;
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    }
+  }
+
+  if (!jsonOutput) {
+    console.log(pc.bold(`Warden bench — ${iterations} iterations`));
+    console.log(pc.dim(`Measuring policy + scrubber overhead (no downstream server)\n`));
+  }
+
+  // We measure the pure in-process overhead: policy evaluation + scrubbing
+  // on a synthetic tool call, without spawning any MCP process.
+  // This reflects the latency warden adds to each call.
+
+  const { createPolicyEngine }      = await import('./policy.js');
+  const { createScrubberFromConfig } = await import('./scrubber.js');
+
+  // Suppress debug logs to stderr during the hot loop
+  const origStderrWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = () => true;
+
+  const policy   = createPolicyEngine({ defaultAction: 'allow', rules: [] });
+  const scrub    = createScrubberFromConfig({ enabled: true });
+
+  const syntheticArgs = {
+    path:    '/Users/you/file.txt',
+    content: 'Hello, world! This is a synthetic payload for benchmarking.',
+    token:   'ghp_1234567890abcdef1234567890abcdef1234',
+  };
+
+  const timings: number[] = [];
+
+  // Warmup — 5 iterations, discarded
+  for (let i = 0; i < 5; i++) {
+    const verdict = policy.evaluate(toolName, syntheticArgs);
+    if (verdict.action !== 'deny') scrub(syntheticArgs);
+  }
+
+  // Measured run
+  for (let i = 0; i < iterations; i++) {
+    const t0 = performance.now();
+    const verdict = policy.evaluate(toolName, syntheticArgs);
+    if (verdict.action !== 'deny') scrub(syntheticArgs);
+    timings.push(performance.now() - t0);
+  }
+
+  // Restore stderr
+  process.stderr.write = origStderrWrite;
+
+  timings.sort((a, b) => a - b);
+
+  const mean   = timings.reduce((a, b) => a + b, 0) / timings.length;
+  const p50    = timings[Math.floor(timings.length * 0.50)]!;
+  const p95    = timings[Math.floor(timings.length * 0.95)]!;
+  const p99    = timings[Math.floor(timings.length * 0.99)]!;
+  const minVal = timings[0]!;
+  const maxVal = timings[timings.length - 1]!;
+
+  const fmt = (n: number): string => n.toFixed(3) + 'ms';
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({
+      iterations,
+      tool: toolName,
+      mean_ms:  parseFloat(mean.toFixed(3)),
+      p50_ms:   parseFloat(p50.toFixed(3)),
+      p95_ms:   parseFloat(p95.toFixed(3)),
+      p99_ms:   parseFloat(p99.toFixed(3)),
+      min_ms:   parseFloat(minVal.toFixed(3)),
+      max_ms:   parseFloat(maxVal.toFixed(3)),
+    }, null, 2));
+  } else {
+    console.log(`  ${pc.cyan('mean')}   ${fmt(mean)}`);
+    console.log(`  ${pc.cyan('p50')}    ${fmt(p50)}`);
+    console.log(`  ${pc.cyan('p95')}    ${fmt(p95)}`);
+    console.log(`  ${pc.cyan('p99')}    ${fmt(p99)}`);
+    console.log(`  ${pc.cyan('min')}    ${fmt(minVal)}`);
+    console.log(`  ${pc.cyan('max')}    ${fmt(maxVal)}`);
+    console.log();
+
+    const grade =
+      mean < 0.5  ? pc.green('Excellent (< 0.5ms per call)') :
+      mean < 2.0  ? pc.green('Good (< 2ms per call)') :
+      mean < 5.0  ? pc.yellow('Acceptable (< 5ms per call)') :
+                    pc.red('Slow (> 5ms — check for heavy policy rules)');
+
+    console.log(`  Overhead grade: ${grade}`);
+    console.log(
+      pc.dim(`\n  (This measures policy evaluation + secret scrubbing only.\n` +
+             `   Actual MCP round-trip will add stdio serialisation overhead.)`),
+    );
+  }
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
 
@@ -792,6 +903,10 @@ async function main(): Promise<void> {
 
     case 'export':
       await cmdExport(argv.slice(1));
+      break;
+
+    case 'bench':
+      await cmdBench(argv.slice(1));
       break;
 
     default:
