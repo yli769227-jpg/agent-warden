@@ -74,6 +74,7 @@ function printUsage(): void {
       `  ${pc.cyan('policy-check')}      Dry-run a tool call through the policy engine without proxying`,
       `  ${pc.cyan('scrub-test')}        Show which fields in a JSON payload would be redacted`,
       `  ${pc.cyan('report')}            Generate a Markdown audit summary report (--output, --since)`,
+      `  ${pc.cyan('watch')}             Smart real-time watcher — alerts on bursts, cascading denies, kill events`,
       '',
       `${pc.bold('Options:')}`,
       `  -h, --help        Show this help message`,
@@ -927,6 +928,194 @@ async function cmdRotate(flags: string[]): Promise<void> {
   }
 }
 
+// ─── Command: watch ───────────────────────────────────────────────────────────
+
+async function cmdWatch(flags: string[]): Promise<void> {
+  // Smart real-time watcher with anomaly detection
+  // Flags:
+  //   --burst-threshold N    Alert if any tool called >N times in burst window (default 10)
+  //   --burst-window-ms N    Burst detection window in ms (default 60000)
+  //   --deny-streak N        Alert after N consecutive denies for same tool (default 3)
+  //   --no-color             Disable colored output
+  //   --silent               Only show alerts, not normal tool calls
+
+  let burstThreshold = 10;
+  let burstWindowMs  = 60_000;
+  let denyStreak     = 3;
+  let silent         = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === '--silent') {
+      silent = true;
+    } else if (f === '--burst-threshold' && flags[i + 1]) {
+      burstThreshold = parseInt(flags[++i]!, 10);
+    } else if (f === '--burst-window-ms' && flags[i + 1]) {
+      burstWindowMs = parseInt(flags[++i]!, 10);
+    } else if (f === '--deny-streak' && flags[i + 1]) {
+      denyStreak = parseInt(flags[++i]!, 10);
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.yellow(`Waiting for log file: ${logFile}`));
+  }
+
+  // State for anomaly detection
+  // burstBuckets: tool → array of timestamps (calls within the window)
+  const burstBuckets: Map<string, number[]> = new Map();
+  // denyStreaks: tool → consecutive deny count
+  const denyStreaks: Map<string, number>    = new Map();
+  // alerted: track what we already alerted to avoid spam
+  const alertedBurst: Set<string>          = new Set();
+
+  const ALERT_COOLDOWN_MS = 30_000; // 30s between same-type burst alerts
+  const lastBurstAlert: Map<string, number> = new Map();
+
+  function printAlert(label: string, msg: string): void {
+    const ts = new Date().toLocaleTimeString();
+    console.log(`\n${pc.bgRed(pc.white(` ${label} `))} ${pc.dim(ts)} ${msg}\n`);
+  }
+
+  function analyzeEntry(entry: AuditEntry): void {
+    const tool    = entry.tool ?? 'unknown';
+    const verdict = entry.verdict ?? 'unknown';
+    const ts      = entry.ts ? new Date(entry.ts).getTime() : Date.now();
+
+    // ── Burst detection ───────────────────────────────────────────────────────
+    const calls = burstBuckets.get(tool) ?? [];
+    const cutoff = ts - burstWindowMs;
+    const recent = calls.filter(t => t >= cutoff);
+    recent.push(ts);
+    burstBuckets.set(tool, recent);
+
+    if (recent.length >= burstThreshold) {
+      const lastAlert = lastBurstAlert.get(tool) ?? 0;
+      if (ts - lastAlert > ALERT_COOLDOWN_MS) {
+        lastBurstAlert.set(tool, ts);
+        printAlert('BURST',
+          `${pc.bold(tool)} called ${pc.yellow(String(recent.length))} times in the last ${
+            Math.round(burstWindowMs / 1000)}s`
+        );
+      }
+    }
+
+    // ── Consecutive deny streak ───────────────────────────────────────────────
+    if (verdict === 'deny' || verdict === 'killed') {
+      const streak = (denyStreaks.get(tool) ?? 0) + 1;
+      denyStreaks.set(tool, streak);
+
+      if (streak >= denyStreak) {
+        printAlert('DENY STREAK',
+          `${pc.bold(tool)} denied ${pc.red(String(streak))} times in a row`
+        );
+      }
+    } else {
+      denyStreaks.delete(tool); // reset streak on allow
+    }
+
+    // ── Kill switch event ─────────────────────────────────────────────────────
+    if (verdict === 'killed') {
+      const reason = (entry as unknown as Record<string, unknown>)['reason'] as string | undefined;
+      printAlert('KILL SWITCH',
+        `${pc.bold(tool)} blocked — kill switch is active${reason ? `: ${reason}` : ''}`
+      );
+    }
+
+    // ── Normal output (unless silent) ─────────────────────────────────────────
+    if (!silent) {
+      const verdictStr =
+        verdict === 'allow'  ? pc.green('ALLOW ')  :
+        verdict === 'deny'   ? pc.red('DENY  ')    :
+        verdict === 'killed' ? pc.bgRed(pc.white('KILLED')) :
+                               pc.yellow(String(verdict).padEnd(6));
+      const dur = entry.durationMs != null ? pc.dim(` ${entry.durationMs}ms`) : '';
+      console.log(`${pc.dim(entry.ts ?? '')} ${verdictStr} ${pc.bold(tool)}${dur}`);
+    }
+  }
+
+  // ── Tail the log file from the end ────────────────────────────────────────
+  console.log(`${pc.bold('agent-warden watch')} — monitoring ${pc.cyan(logFile)}`);
+  console.log(pc.dim(`  Burst alert: >${burstThreshold} calls/${Math.round(burstWindowMs/1000)}s · Deny streak: ${denyStreak}x`));
+  console.log(pc.dim('  Press Ctrl+C to stop'));
+  console.log();
+
+  let fd: number | null = null;
+  let fileOffset = 0;
+  let buffer = '';
+
+  function openFile(): boolean {
+    if (!fs.existsSync(logFile)) return false;
+    try {
+      fd = fs.openSync(logFile, 'r');
+      // Start at end of file
+      fileOffset = fs.fstatSync(fd).size;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function readNew(): void {
+    if (fd === null) {
+      if (!openFile()) return;
+    }
+
+    try {
+      const stat = fs.fstatSync(fd!);
+      if (stat.size < fileOffset) {
+        // File was truncated/rotated — reopen
+        fs.closeSync(fd!);
+        fd = null;
+        fileOffset = 0;
+        buffer = '';
+        openFile();
+        return;
+      }
+
+      if (stat.size > fileOffset) {
+        const toRead = stat.size - fileOffset;
+        const chunk  = Buffer.alloc(toRead);
+        const read   = fs.readSync(fd!, chunk, 0, toRead, fileOffset);
+        fileOffset += read;
+        buffer += chunk.slice(0, read).toString('utf8');
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? ''; // keep incomplete last line
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const entry = JSON.parse(line) as AuditEntry;
+            analyzeEntry(entry);
+          } catch {
+            // malformed line — skip
+          }
+        }
+      }
+    } catch {
+      // fd may have become invalid after rotation
+      fd = null;
+    }
+  }
+
+  openFile();
+
+  const interval = setInterval(readNew, 250);
+
+  process.on('SIGINT', () => {
+    clearInterval(interval);
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+    console.log('\n' + pc.dim('Watch stopped.'));
+    process.exit(0);
+  });
+
+  // Keep alive
+  await new Promise<void>(() => { /* never resolves — SIGINT exits */ });
+}
+
 // ─── Command: report ──────────────────────────────────────────────────────────
 
 async function cmdReport(flags: string[]): Promise<void> {
@@ -1661,6 +1850,10 @@ async function main(): Promise<void> {
 
     case 'report':
       await cmdReport(argv.slice(1));
+      break;
+
+    case 'watch':
+      await cmdWatch(argv.slice(1));
       break;
 
     default:
