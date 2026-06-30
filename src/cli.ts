@@ -17,7 +17,7 @@ import path from 'node:path';
 import os from 'node:os';
 import url from 'node:url';
 import readline from 'node:readline';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import pc from 'picocolors';
 import { loadConfig } from './config.js';
 import { runProxy } from './proxy.js';
@@ -996,6 +996,236 @@ async function cmdRotate(flags: string[]): Promise<void> {
 
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
+  }
+}
+
+// ─── Command: export-html ─────────────────────────────────────────────────────
+
+async function cmdExportHtml(flags: string[]): Promise<void> {
+  // Generates a self-contained interactive HTML report from the audit log.
+  // All JS and CSS is inlined — no external dependencies.
+  //
+  // Flags:
+  //   --output/-o <path>   Output file (default: warden-report-<ts>.html)
+  //   --since/-s <expr>    Only include entries since this date
+  //   --title/-t <text>    Page title
+  //   --max-rows <N>       Maximum rows to embed (default 5000)
+  //   --open               Open in default browser after generating
+
+  let outputPath: string | undefined;
+  let sinceDate: Date | undefined;
+  let title    = 'Warden Audit Report';
+  let maxRows  = 5000;
+  let autoOpen = false;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--output' || f === '-o') && flags[i + 1]) {
+      outputPath = flags[++i];
+    } else if ((f === '--since' || f === '-s') && flags[i + 1]) {
+      sinceDate  = parseSince(flags[++i]!);
+    } else if ((f === '--title' || f === '-t') && flags[i + 1]) {
+      title      = flags[++i]!;
+    } else if (f === '--max-rows' && flags[i + 1]) {
+      maxRows    = parseInt(flags[++i]!, 10) || 5000;
+    } else if (f === '--open') {
+      autoOpen   = true;
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Read and aggregate entries ──────────────────────────────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  const rows: AuditEntry[] = [];
+  let   total = 0, allowed = 0, denied = 0, killed = 0, totalMs = 0;
+  const toolCounts: Record<string, number> = {};
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { continue; }
+
+    if (sinceDate && entry.ts && new Date(entry.ts) < sinceDate) continue;
+
+    total++;
+    if (entry.verdict === 'allow')        allowed++;
+    else if (entry.verdict === 'deny')    denied++;
+    else if (entry.verdict === 'killed')  killed++;
+    totalMs += entry.durationMs ?? 0;
+
+    const t = entry.tool ?? '(unknown)';
+    toolCounts[t] = (toolCounts[t] ?? 0) + 1;
+
+    if (rows.length < maxRows) rows.push(entry);
+  }
+
+  const avgMs  = total > 0 ? Math.round(totalMs / total) : 0;
+  const topTools = Object.entries(toolCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 15)
+    .map(([tool, count]) => ({ tool, count, pct: Math.round(count / total * 100) }));
+
+  // ── Inline JSON data into the HTML ─────────────────────────────────────────
+  const rowsJson  = JSON.stringify(rows);
+  const topJson   = JSON.stringify(topTools);
+  const statsJson = JSON.stringify({
+    total, allowed, denied, killed, avgMs,
+    denyRate: total > 0 ? Math.round(denied / total * 100) : 0,
+  });
+  const generatedAt = new Date().toISOString();
+
+  const escHtml = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escHtml(title)}</title>
+<style>
+:root {
+  --bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;
+  --text:#e2e4ec;--muted:#6b7280;--accent:#6366f1;
+  --green:#22c55e;--yellow:#f59e0b;--red:#ef4444;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif;padding:24px}
+h1{font-size:1.5rem;font-weight:700;margin-bottom:4px}
+.meta{color:var(--muted);font-size:12px;margin-bottom:24px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px;margin-bottom:24px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px}
+.card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+.card .value{font-size:1.75rem;font-weight:700}
+.card.green .value{color:var(--green)}.card.yellow .value{color:var(--yellow)}.card.red .value{color:var(--red)}
+.section{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:24px}
+.section h2{font-size:1rem;font-weight:600;margin-bottom:12px}
+.bar-row{display:flex;align-items:center;gap:10px;margin-bottom:6px;font-size:12px}
+.bar-row .tname{width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--muted)}
+.bar-row .bwrap{flex:1;background:var(--border);border-radius:4px;height:8px}
+.bar-row .bar{background:var(--accent);border-radius:4px;height:8px}
+.controls{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+.controls input,.controls select{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:13px}
+.controls input{flex:1;min-width:180px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--muted);font-weight:500;white-space:nowrap;cursor:pointer;user-select:none}
+th:hover{color:var(--text)}
+td{padding:7px 10px;border-bottom:1px solid #1e2130;vertical-align:top}
+tr:hover td{background:#1e2130}
+.badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:500}
+.badge.allow{background:#14532d;color:#4ade80}.badge.deny{background:#450a0a;color:#f87171}
+.badge.killed{background:#3b0764;color:#e879f9}.badge.other{background:var(--border);color:var(--muted)}
+.args{max-width:350px;white-space:pre-wrap;word-break:break-all;color:var(--muted)}
+.pager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:12px}
+.pager button{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px}
+.pager button:disabled{opacity:.4;cursor:default}
+.pager .info{color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<h1>${escHtml(title)}</h1>
+<div class="meta">Generated ${generatedAt} · Log: ${escHtml(logFile)} · Showing up to ${maxRows.toLocaleString()} rows</div>
+<div class="grid" id="sg"></div>
+<div class="section"><h2>Top Tools</h2><div id="tt"></div></div>
+<div class="section">
+  <h2>Audit Log</h2>
+  <div class="controls">
+    <input id="q" type="search" placeholder="Filter by tool, verdict, reason…" oninput="applyF()">
+    <select id="vf" onchange="applyF()">
+      <option value="">All verdicts</option>
+      <option value="allow">allow</option>
+      <option value="deny">deny</option>
+      <option value="killed">killed</option>
+    </select>
+  </div>
+  <table>
+    <thead><tr>
+      <th onclick="sb('ts')">Timestamp</th>
+      <th onclick="sb('tool')">Tool</th>
+      <th onclick="sb('verdict')">Verdict</th>
+      <th onclick="sb('durationMs')">Latency</th>
+      <th>Args / Reason</th>
+    </tr></thead>
+    <tbody id="lb"></tbody>
+  </table>
+  <div class="pager">
+    <button id="pb" onclick="pp()">← Prev</button>
+    <span class="info" id="pi"></span>
+    <button id="nb" onclick="np()">Next →</button>
+  </div>
+</div>
+<script>
+const ROWS=${rowsJson};
+const TOP=${topJson};
+const S=${statsJson};
+(function(){
+  const g=document.getElementById('sg');
+  const cards=[
+    {l:'Total Calls',v:S.total.toLocaleString(),c:''},
+    {l:'Allowed',v:S.allowed.toLocaleString(),c:'green'},
+    {l:'Denied',v:S.denied.toLocaleString(),c:S.denied>0?'yellow':''},
+    {l:'Killed',v:S.killed.toLocaleString(),c:S.killed>0?'red':''},
+    {l:'Deny Rate',v:S.denyRate+'%',c:S.denyRate>=20?'red':S.denyRate>0?'yellow':'green'},
+    {l:'Avg Latency',v:S.avgMs+'ms',c:''},
+  ];
+  g.innerHTML=cards.map(c=>\`<div class="card \${c.c}"><div class="label">\${c.l}</div><div class="value">\${c.v}</div></div>\`).join('');
+})();
+(function(){
+  const el=document.getElementById('tt');
+  const mx=TOP.length?TOP[0].pct:1;
+  el.innerHTML=TOP.map(t=>\`<div class="bar-row"><div class="tname" title="\${t.tool}">\${t.tool}</div><div class="bwrap"><div class="bar" style="width:\${(t.pct/Math.max(mx,1)*100).toFixed(1)}%"></div></div><div style="width:40px;text-align:right;font-size:12px">\${t.count}</div></div>\`).join('');
+})();
+let fil=[...ROWS],sk='ts',sd=-1,pg=0;
+const PS=50;
+function fts(ts){if(!ts)return'';try{return new Date(ts).toLocaleString();}catch{return ts;}}
+function fa(e){const p=[];if(e.reason)p.push('reason: '+e.reason);if(e.args&&Object.keys(e.args).length){const s=JSON.stringify(e.args);p.push(s.length>200?s.slice(0,200)+'…':s);}return p.join('\\n');}
+function vb(v){const c=v==='allow'?'allow':v==='deny'?'deny':v==='killed'?'killed':'other';return\`<span class="badge \${c}">\${v??''}</span>\`;}
+function render(){
+  const sl=fil.slice(pg*PS,(pg+1)*PS);
+  document.getElementById('lb').innerHTML=sl.map(e=>\`<tr><td style="white-space:nowrap;color:var(--muted)">\${fts(e.ts)}</td><td>\${e.tool??''}</td><td>\${vb(e.verdict)}</td><td style="white-space:nowrap">\${e.durationMs!=null?e.durationMs+'ms':''}</td><td class="args">\${fa(e)}</td></tr>\`).join('');
+  const tp=Math.max(1,Math.ceil(fil.length/PS));
+  document.getElementById('pi').textContent=fil.length.toLocaleString()+' rows · page '+(pg+1)+' / '+tp;
+  document.getElementById('pb').disabled=pg===0;
+  document.getElementById('nb').disabled=pg>=tp-1;
+}
+function applyF(){
+  const q=document.getElementById('q').value.toLowerCase();
+  const v=document.getElementById('vf').value;
+  fil=ROWS.filter(e=>{
+    if(v&&e.verdict!==v)return false;
+    if(q){const h=(e.tool??'')+' '+(e.verdict??'')+' '+(e.reason??'')+' '+JSON.stringify(e.args??'');if(!h.toLowerCase().includes(q))return false;}
+    return true;
+  });pg=0;render();
+}
+function sb(k){if(sk===k)sd*=-1;else{sk=k;sd=-1;}fil.sort((a,b)=>{const av=a[k]??'',bv=b[k]??'';return av<bv?sd:av>bv?-sd:0;});pg=0;render();}
+function pp(){if(pg>0){pg--;render();}}
+function np(){pg++;render();}
+render();
+</script>
+</body>
+</html>`;
+
+  // ── Write output ────────────────────────────────────────────────────────────
+  const ts      = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const outFile = outputPath ?? `warden-report-${ts}.html`;
+
+  fs.writeFileSync(outFile, html, 'utf8');
+  const kb = (Buffer.byteLength(html) / 1024).toFixed(1);
+  console.log(`${pc.green('✓')} Report written to ${pc.bold(outFile)} (${rows.length.toLocaleString()} rows, ${kb} KB)`);
+
+  if (autoOpen) {
+    const opener = process.platform === 'darwin' ? 'open'
+                 : process.platform === 'win32'  ? 'start'
+                 : 'xdg-open';
+    spawnSync(opener, [outFile], { stdio: 'ignore' });
   }
 }
 
@@ -4756,6 +4986,10 @@ async function main(): Promise<void> {
     case 'heat-map':
     case 'heatmap':
       await cmdHeatMap(argv.slice(1));
+      break;
+
+    case 'export-html':
+      await cmdExportHtml(argv.slice(1));
       break;
 
     default:
