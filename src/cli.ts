@@ -17,6 +17,7 @@ import path from 'node:path';
 import os from 'node:os';
 import url from 'node:url';
 import readline from 'node:readline';
+import zlib from 'node:zlib';
 import { spawn, spawnSync } from 'node:child_process';
 import pc from 'picocolors';
 import { loadConfig } from './config.js';
@@ -2398,6 +2399,137 @@ async function cmdPolicyStats(flags: string[]): Promise<void> {
   }
 
   console.log();
+}
+
+// ─── Command: archive ─────────────────────────────────────────────────────────
+
+async function cmdArchive(flags: string[]): Promise<void> {
+  // Compresses audit log entries older than --before into a gzip archive and
+  // optionally removes them from the live log, keeping the active log lean.
+  //
+  // A single-line "archive index" JSONL entry is appended to an index file
+  // so `warden stats` can still account for archived history.
+  //
+  // Flags:
+  //   --before/-b <expr>   Archive entries older than this date (default: 7d ago)
+  //   --output/-o <path>   Archive file path (default: <logfile>.YYYY-MM-DD.gz)
+  //   --dry-run            Show what would be archived without writing
+  //   --no-delete          Keep archived entries in the live log (default: delete)
+  //   --index <path>       Write archive index entry to this JSONL file
+
+  let beforeDate: Date = new Date(Date.now() - 7 * 24 * 3_600_000);
+  let outputPath: string | undefined;
+  let dryRun    = false;
+  let noDelete  = false;
+  let indexPath: string | undefined;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--before' || f === '-b') && flags[i + 1]) {
+      beforeDate = parseSince(flags[++i]!) ?? beforeDate;
+    } else if ((f === '--output' || f === '-o') && flags[i + 1]) {
+      outputPath = flags[++i];
+    } else if (f === '--dry-run') {
+      dryRun     = true;
+    } else if (f === '--no-delete') {
+      noDelete   = true;
+    } else if (f === '--index' && flags[i + 1]) {
+      indexPath  = flags[++i];
+    }
+  }
+
+  const logFile = process.env['WARDEN_LOG'] ?? DEFAULT_LOG_FILE;
+
+  if (!fs.existsSync(logFile)) {
+    console.error(pc.red(`Log file not found: ${logFile}`));
+    process.exit(1);
+  }
+
+  // ── Pass 1: scan, count, and collect entries to archive ────────────────────
+  const rs = fs.createReadStream(logFile, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+
+  const toArchive: string[] = [];
+  const toKeep:    string[] = [];
+  let   archiveCalls   = 0, keepCalls = 0;
+  let   archiveAllowed = 0, archiveDenied = 0, archiveKilled = 0;
+  let   firstTs: string | undefined, lastTs: string | undefined;
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry: AuditEntry;
+    try { entry = JSON.parse(line) as AuditEntry; } catch { toKeep.push(line); continue; }
+
+    const ts = entry.ts ? new Date(entry.ts) : null;
+    if (ts && ts < beforeDate) {
+      toArchive.push(line);
+      archiveCalls++;
+      if (entry.verdict === 'allow')        archiveAllowed++;
+      else if (entry.verdict === 'deny')    archiveDenied++;
+      else if (entry.verdict === 'killed')  archiveKilled++;
+      if (!firstTs || entry.ts! < firstTs) firstTs = entry.ts!;
+      if (!lastTs  || entry.ts! > lastTs)  lastTs  = entry.ts!;
+    } else {
+      toKeep.push(line);
+      keepCalls++;
+    }
+  }
+
+  if (toArchive.length === 0) {
+    console.log(pc.dim(`No entries older than ${beforeDate.toISOString()} to archive.`));
+    return;
+  }
+
+  const dateStr    = beforeDate.toISOString().slice(0, 10);
+  const archiveFile = outputPath ?? `${logFile}.${dateStr}.gz`;
+
+  if (dryRun) {
+    console.log(`${pc.bold('[dry-run]')} Would archive ${archiveCalls} entries to ${archiveFile}`);
+    console.log(`  First: ${firstTs ?? 'n/a'}  Last: ${lastTs ?? 'n/a'}`);
+    console.log(`  Live log would retain ${keepCalls} entries`);
+    return;
+  }
+
+  // ── Write gzip archive ─────────────────────────────────────────────────────
+  await new Promise<void>((resolve, reject) => {
+    const gzip = zlib.createGzip({ level: 9 });
+    const out  = fs.createWriteStream(archiveFile);
+    gzip.pipe(out);
+    for (const line of toArchive) gzip.write(line + '\n');
+    gzip.end();
+    out.on('finish', resolve);
+    out.on('error', reject);
+  });
+
+  // ── Rewrite live log without archived entries ──────────────────────────────
+  if (!noDelete) {
+    const tmp = logFile + '.tmp';
+    fs.writeFileSync(tmp, toKeep.join('\n') + (toKeep.length > 0 ? '\n' : ''), 'utf8');
+    fs.renameSync(tmp, logFile);
+  }
+
+  // ── Write index entry ──────────────────────────────────────────────────────
+  if (indexPath) {
+    const indexEntry = JSON.stringify({
+      ts:       new Date().toISOString(),
+      archive:  archiveFile,
+      firstTs, lastTs,
+      calls:    archiveCalls,
+      allowed:  archiveAllowed,
+      denied:   archiveDenied,
+      killed:   archiveKilled,
+    });
+    fs.appendFileSync(indexPath, indexEntry + '\n', 'utf8');
+  }
+
+  const archiveSizeKb = (fs.statSync(archiveFile).size / 1024).toFixed(1);
+  console.log(`${pc.green('✓')} Archived ${pc.bold(String(archiveCalls))} entries to ${pc.bold(archiveFile)} (${archiveSizeKb} KB)`);
+  if (!noDelete) {
+    console.log(`  Live log trimmed to ${keepCalls} entries.`);
+  }
+  if (indexPath) {
+    console.log(`  Index appended to ${indexPath}`);
+  }
 }
 
 // ─── Command: heat-map ────────────────────────────────────────────────────────
@@ -6190,6 +6322,10 @@ async function main(): Promise<void> {
 
     case 'policy-stats':
       await cmdPolicyStats(argv.slice(1));
+      break;
+
+    case 'archive':
+      await cmdArchive(argv.slice(1));
       break;
 
     default:
