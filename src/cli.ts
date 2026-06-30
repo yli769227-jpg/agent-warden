@@ -81,6 +81,7 @@ function printUsage(): void {
       `  ${pc.cyan('validate')}          Validate config file and report all errors with field paths`,
       `  ${pc.cyan('alert-test')}        Send a test webhook to all configured targets and report results`,
       `  ${pc.cyan('config-gen')}        Scan Claude Desktop / Claude Code config and generate warden.config.yaml`,
+      `  ${pc.cyan('server-list')}        Connect to all configured servers and list available tools`,
       `  ${pc.cyan('install')}           Inject warden proxy into Claude Desktop / Claude Code (backs up original)`,
       `  ${pc.cyan('uninstall')}         Restore original MCP server config from backup`,
       '',
@@ -943,6 +944,135 @@ async function cmdRotate(flags: string[]): Promise<void> {
   if (backups.length > 0) {
     console.log(pc.dim(`  (${backups.length} older backup${backups.length !== 1 ? 's' : ''} remain)`));
   }
+}
+
+// ─── Command: server-list ─────────────────────────────────────────────────────
+
+async function cmdServerList(flags: string[]): Promise<void> {
+  // Connects to all configured MCP servers and lists their tools + descriptions.
+  // Helps users write accurate glob rules in policy config.
+  //
+  // Flags:
+  //   --server/-s <name>   Only list tools for this server
+  //   --json/-j            Machine-readable output
+  //   --config/-c <path>   Config file path
+
+  let serverFilter: string | undefined;
+  let jsonOutput  = false;
+  let configArg: string | undefined;
+
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if ((f === '--server' || f === '-s') && flags[i + 1]) {
+      serverFilter = flags[++i];
+    } else if (f === '--json' || f === '-j') {
+      jsonOutput = true;
+    } else if ((f === '--config' || f === '-c') && flags[i + 1]) {
+      configArg = flags[++i];
+    }
+  }
+
+  const { Client }              = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+  // Suppress config/proxy stderr during tool-list phase
+  const origStderr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = () => true;
+  let config: ReturnType<typeof loadConfig>;
+  try {
+    config = loadConfig(configArg);
+  } finally {
+    process.stderr.write = origStderr;
+  }
+
+  const serverMap = config.servers ?? {};
+  const serverNames = Object.keys(serverMap).filter(n => !serverFilter || n === serverFilter);
+
+  if (serverNames.length === 0) {
+    if (serverFilter) {
+      console.error(pc.red(`No server named "${serverFilter}" in config`));
+    } else {
+      console.error(pc.red('No servers configured'));
+    }
+    process.exit(1);
+  }
+
+  type ToolEntry = { server: string; tool: string; description: string };
+  const all: ToolEntry[] = [];
+  const errors: Array<{ server: string; error: string }> = [];
+
+  if (!jsonOutput) {
+    console.log(`${pc.bold('Connecting to')} ${serverNames.length} server${serverNames.length > 1 ? 's' : ''}...\n`);
+  }
+
+  for (const serverName of serverNames) {
+    const serverCfg = serverMap[serverName];
+    if (!serverCfg) continue;
+
+    // Build env for this server (merge process.env + server-specific env)
+    const serverEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v !== undefined) serverEnv[k] = v;
+    }
+    for (const [k, v] of Object.entries(serverCfg.env ?? {})) {
+      serverEnv[k] = v;
+    }
+
+    const client = new Client({ name: 'warden-server-list', version: VERSION });
+    const transport = new StdioClientTransport({
+      command: serverCfg.command,
+      args:    serverCfg.args ?? [],
+      env:     serverEnv,
+      stderr:  'pipe',
+    });
+
+    try {
+      await client.connect(transport);
+      const { tools } = await client.listTools();
+      await client.close();
+
+      for (const tool of tools) {
+        const prefixed = `${serverName}/${tool.name}`;
+        all.push({
+          server:      serverName,
+          tool:        prefixed,
+          description: tool.description ?? '',
+        });
+      }
+
+      if (!jsonOutput) {
+        console.log(`  ${pc.green('✓')} ${pc.bold(serverName)} — ${tools.length} tool${tools.length !== 1 ? 's' : ''}`);
+        for (const tool of tools) {
+          const prefixed = `${serverName}/${tool.name}`;
+          const desc     = tool.description ? pc.dim(` — ${tool.description.slice(0, 80)}`) : '';
+          console.log(`      ${pc.cyan(prefixed)}${desc}`);
+        }
+        console.log();
+      }
+    } catch (err) {
+      const msg = (err as Error).message ?? String(err);
+      errors.push({ server: serverName, error: msg });
+      if (!jsonOutput) {
+        console.log(`  ${pc.red('✗')} ${pc.bold(serverName)} — ${pc.red(msg.slice(0, 100))}`);
+        console.log();
+      }
+    }
+  }
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({ tools: all, errors }, null, 2));
+    return;
+  }
+
+  if (errors.length > 0) {
+    process.exit(1);
+  }
+
+  console.log(pc.dim(`${all.length} tools across ${serverNames.length - errors.length} server${serverNames.length - errors.length !== 1 ? 's' : ''}`));
+  console.log();
+  console.log(pc.dim('Tip: use these exact tool names in policy rules:'));
+  console.log(pc.dim('  - tool: "fs/read_file"    action: allow'));
+  console.log(pc.dim('  - tool: "fs/*delete*"     action: deny'));
 }
 
 // ─── Command: install / uninstall ─────────────────────────────────────────────
@@ -2537,6 +2667,11 @@ async function main(): Promise<void> {
 
     case 'uninstall':
       await cmdUninstall(argv.slice(1));
+      break;
+
+    case 'server-list':
+    case 'list-tools':
+      await cmdServerList(argv.slice(1));
       break;
 
     default:
