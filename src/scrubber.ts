@@ -55,6 +55,24 @@ const DEFAULT_PATTERN_DEFS: ReadonlyArray<{ source: string; flags: string }> =
 const ENV_LINE_SOURCE = '^([A-Z_]+=)(.+)$';
 const ENV_LINE_FLAGS = 'gm';
 
+// ---------------------------------------------------------------------------
+// Key-name heuristic
+//
+// The format regexes above only fire when a secret's *value* matches a known
+// shape AND (for the quoted-assignment rule) the key+value live in the same
+// string.  Structured MCP args like { "password": "hunter2long" } are walked
+// key-by-key, so the value leaf "hunter2long" never matches any format regex
+// and leaks.  We close that gap by redacting the whole string value whenever
+// its *key* looks sensitive.
+// ---------------------------------------------------------------------------
+
+const SENSITIVE_KEY_RE =
+  /(secret|token|passwd|password|pwd|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|client[_-]?secret|bearer|auth[_-]?token)/i;
+
+function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_KEY_RE.test(key);
+}
+
 function looksLikeSecret(value: string): boolean {
   if (value.length <= 12) return false;
 
@@ -135,6 +153,15 @@ function walkAndScrub(
     let total = 0;
     const obj: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      // Key-aware redaction: a non-empty string under a sensitive-looking key
+      // is redacted wholesale, regardless of whether its value matches any
+      // format pattern.  Non-string values (nested objects/arrays) still
+      // recurse so we don't blanket-blackhole structured data.
+      if (isSensitiveKey(k) && typeof v === 'string' && v.length > 0) {
+        obj[k] = REDACTED;
+        total += 1;
+        continue;
+      }
       const { result, count } = walkAndScrub(v, patterns);
       total += count;
       obj[k] = result;

@@ -186,9 +186,18 @@ export function createPolicyEngine(config: PolicyConfig): PolicyEngine {
       }
 
       // ── 2. Built-in dangerous patterns ───────────────────────────────────
-      const dangerousName = hasDangerousNameKeyword(toolName);
+      // Multi-server mode registers tools as "<server>/<tool>" (see proxy.ts).
+      // The built-in name heuristics match on the bare tool name, so strip any
+      // server prefix first — otherwise "filesystem/write_file" matches neither
+      // the exact fs-write set nor the "*_write"/"*_create" suffix and the
+      // out-of-cwd write protection never runs. Explicit rules above still
+      // match the full prefixed name.
+      const baseName = toolName.includes('/')
+        ? toolName.slice(toolName.lastIndexOf('/') + 1)
+        : toolName;
+      const dangerousName = hasDangerousNameKeyword(baseName);
       const dangerousFs =
-        isFsWriteToolName(toolName) &&
+        isFsWriteToolName(baseName) &&
         argsContainOutsideCwdPath(args, cwd);
 
       if (dangerousName || dangerousFs) {
