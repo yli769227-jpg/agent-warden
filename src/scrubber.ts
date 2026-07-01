@@ -32,8 +32,12 @@ const _DEFAULT_REGEXES: readonly RegExp[] = [
   // PEM private keys (RSA, EC, DSA, …)
   /-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+ PRIVATE KEY-----/g,
 
-  // GitHub personal-access / fine-grained / OAuth / refresh tokens
-  /gh[pousr]_[A-Za-z0-9]{36}/g,
+  // GitHub classic personal-access / OAuth / refresh / server tokens.
+  // Length is >=36 (not exactly 36) so longer future variants still match.
+  /gh[pousr]_[A-Za-z0-9]{36,}/g,
+
+  // GitHub fine-grained PATs — prefix `github_pat_` followed by ~82 chars.
+  /github_pat_[A-Za-z0-9_]{22,}/g,
 
   // HTTP Authorization: Bearer …
   /Bearer\s+[A-Za-z0-9\-._~+/]+=*/g,
