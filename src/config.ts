@@ -173,6 +173,24 @@ export function loadConfig(configPath?: string): WardenConfig {
     parsed,
   ) as unknown as WardenConfig;
 
+  // ── Propagate top-level `mode` into the policy engine ──────────────────────
+  // The policy engine gates its built-in dangerous-pattern enforcement on
+  // `PolicyConfig.mode` (see policy.ts). That field is NOT part of the
+  // documented YAML shape — `mode` lives at the top level — so without this
+  // line `config.policy.mode` is always undefined and the enforce branch is
+  // dead: dangerous tool calls are silently allowed even when the user asked
+  // for `mode: enforce`. Keep an explicit per-block override if one was set.
+  // Assign a FRESH policy object rather than mutating in place: deepMerge
+  // aliases nested defaults when the loaded config omits `policy`, so an
+  // in-place write would corrupt the shared DEFAULT_CONFIG singleton across
+  // subsequent loadConfig() calls.
+  if (merged.policy) {
+    merged.policy = { ...merged.policy, mode: merged.policy.mode ?? merged.mode };
+  }
+  process.stderr.write(
+    `[warden:config] Policy mode = ${merged.policy?.mode ?? 'audit'}\n`,
+  );
+
   // ── Validate required fields ───────────────────────────────────────────────
   const hasServers =
     merged.servers != null && Object.keys(merged.servers).length > 0;

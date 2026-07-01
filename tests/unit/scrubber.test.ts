@@ -86,13 +86,15 @@ describe('createScrubber', () => {
   // -------------------------------------------------------------------------
   test('6. Array — secret element redacted, non-secret element unchanged', () => {
     const scrub = createScrubber();
+    // `data` is a non-sensitive key name so this exercises value-format matching
+    // (AWS key) in isolation, independent of the key-aware redaction rule.
     const input = [
-      { id: 1, credential: 'AKIAIOSFODNN7EXAMPLE' },
-      { id: 2, credential: 'plain-value' },
+      { id: 1, data: 'AKIAIOSFODNN7EXAMPLE' },
+      { id: 2, data: 'plain-value' },
     ];
     const result = scrub(input) as typeof input;
-    expect((result as Array<{ id: number; credential: string }>)[0].credential).toBe(REDACTED);
-    expect((result as Array<{ id: number; credential: string }>)[1].credential).toBe('plain-value');
+    expect((result as Array<{ id: number; data: string }>)[0].data).toBe(REDACTED);
+    expect((result as Array<{ id: number; data: string }>)[1].data).toBe('plain-value');
   });
 
   // -------------------------------------------------------------------------

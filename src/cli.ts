@@ -1075,9 +1075,21 @@ async function cmdExportHtml(flags: string[]): Promise<void> {
     .map(([tool, count]) => ({ tool, count, pct: Math.round(count / total * 100) }));
 
   // ── Inline JSON data into the HTML ─────────────────────────────────────────
-  const rowsJson  = JSON.stringify(rows);
-  const topJson   = JSON.stringify(topTools);
-  const statsJson = JSON.stringify({
+  // Audit rows carry attacker-influenced strings (tool names, args, reasons
+  // come from downstream MCP servers). JSON.stringify does NOT escape "</script>"
+  // or the U+2028/U+2029 line separators, so a tool named `x</script><img
+  // onerror=...>` would break out of the inline <script> block. Escape the
+  // script-hostile characters into \uXXXX form; the output stays valid JSON/JS.
+  const jsonForScript = (obj: unknown) =>
+    JSON.stringify(obj)
+      .replace(/</g, '\\u003c')
+      .replace(/>/g, '\\u003e')
+      .replace(/&/g, '\\u0026')
+      .replace(/\u2028/g, '\\u2028')
+      .replace(/\u2029/g, '\\u2029');
+  const rowsJson  = jsonForScript(rows);
+  const topJson   = jsonForScript(topTools);
+  const statsJson = jsonForScript({
     total, allowed, denied, killed, avgMs,
     denyRate: total > 0 ? Math.round(denied / total * 100) : 0,
   });
@@ -1167,6 +1179,10 @@ tr:hover td{background:#1e2130}
 const ROWS=${rowsJson};
 const TOP=${topJson};
 const S=${statsJson};
+// HTML-escape untrusted audit values before they hit innerHTML. Tool names,
+// verdicts, reasons and args originate from downstream MCP servers and must
+// never be treated as markup.
+const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 (function(){
   const g=document.getElementById('sg');
   const cards=[
@@ -1182,16 +1198,16 @@ const S=${statsJson};
 (function(){
   const el=document.getElementById('tt');
   const mx=TOP.length?TOP[0].pct:1;
-  el.innerHTML=TOP.map(t=>\`<div class="bar-row"><div class="tname" title="\${t.tool}">\${t.tool}</div><div class="bwrap"><div class="bar" style="width:\${(t.pct/Math.max(mx,1)*100).toFixed(1)}%"></div></div><div style="width:40px;text-align:right;font-size:12px">\${t.count}</div></div>\`).join('');
+  el.innerHTML=TOP.map(t=>\`<div class="bar-row"><div class="tname" title="\${esc(t.tool)}">\${esc(t.tool)}</div><div class="bwrap"><div class="bar" style="width:\${(t.pct/Math.max(mx,1)*100).toFixed(1)}%"></div></div><div style="width:40px;text-align:right;font-size:12px">\${esc(t.count)}</div></div>\`).join('');
 })();
 let fil=[...ROWS],sk='ts',sd=-1,pg=0;
 const PS=50;
 function fts(ts){if(!ts)return'';try{return new Date(ts).toLocaleString();}catch{return ts;}}
 function fa(e){const p=[];if(e.reason)p.push('reason: '+e.reason);if(e.args&&Object.keys(e.args).length){const s=JSON.stringify(e.args);p.push(s.length>200?s.slice(0,200)+'…':s);}return p.join('\\n');}
-function vb(v){const c=v==='allow'?'allow':v==='deny'?'deny':v==='killed'?'killed':'other';return\`<span class="badge \${c}">\${v??''}</span>\`;}
+function vb(v){const c=v==='allow'?'allow':v==='deny'?'deny':v==='killed'?'killed':'other';return\`<span class="badge \${c}">\${esc(v)}</span>\`;}
 function render(){
   const sl=fil.slice(pg*PS,(pg+1)*PS);
-  document.getElementById('lb').innerHTML=sl.map(e=>\`<tr><td style="white-space:nowrap;color:var(--muted)">\${fts(e.ts)}</td><td>\${e.tool??''}</td><td>\${vb(e.verdict)}</td><td style="white-space:nowrap">\${e.durationMs!=null?e.durationMs+'ms':''}</td><td class="args">\${fa(e)}</td></tr>\`).join('');
+  document.getElementById('lb').innerHTML=sl.map(e=>\`<tr><td style="white-space:nowrap;color:var(--muted)">\${esc(fts(e.ts))}</td><td>\${esc(e.tool)}</td><td>\${vb(e.verdict)}</td><td style="white-space:nowrap">\${e.durationMs!=null?esc(e.durationMs)+'ms':''}</td><td class="args">\${esc(fa(e))}</td></tr>\`).join('');
   const tp=Math.max(1,Math.ceil(fil.length/PS));
   document.getElementById('pi').textContent=fil.length.toLocaleString()+' rows · page '+(pg+1)+' / '+tp;
   document.getElementById('pb').disabled=pg===0;
