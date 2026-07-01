@@ -27,6 +27,7 @@ import { WatchAnalyzer } from './watch-analyzer.js';
 import { validateConfigObject } from './validator.js';
 import type { ValidationIssue } from './validator.js';
 import type { AuditEntry } from './types.js';
+import { escapeHtml, jsonForScript, escapeDotString, CLIENT_ESC_FN } from './render/html.js';
 
 // ─── Version (read once from package.json at module load) ─────────────────────
 
@@ -1076,17 +1077,9 @@ async function cmdExportHtml(flags: string[]): Promise<void> {
 
   // ── Inline JSON data into the HTML ─────────────────────────────────────────
   // Audit rows carry attacker-influenced strings (tool names, args, reasons
-  // come from downstream MCP servers). JSON.stringify does NOT escape "</script>"
-  // or the U+2028/U+2029 line separators, so a tool named `x</script><img
-  // onerror=...>` would break out of the inline <script> block. Escape the
-  // script-hostile characters into \uXXXX form; the output stays valid JSON/JS.
-  const jsonForScript = (obj: unknown) =>
-    JSON.stringify(obj)
-      .replace(/</g, '\\u003c')
-      .replace(/>/g, '\\u003e')
-      .replace(/&/g, '\\u0026')
-      .replace(/\u2028/g, '\\u2028')
-      .replace(/\u2029/g, '\\u2029');
+  // from downstream MCP servers). Escaping lives in src/render/html.ts:
+  // jsonForScript neutralizes </script> + U+2028/9 for the inline data island;
+  // escapeHtml handles text/attribute contexts.
   const rowsJson  = jsonForScript(rows);
   const topJson   = jsonForScript(topTools);
   const statsJson = jsonForScript({
@@ -1095,8 +1088,7 @@ async function cmdExportHtml(flags: string[]): Promise<void> {
   });
   const generatedAt = new Date().toISOString();
 
-  const escHtml = (s: string) =>
-    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const escHtml = escapeHtml;
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -1181,8 +1173,8 @@ const TOP=${topJson};
 const S=${statsJson};
 // HTML-escape untrusted audit values before they hit innerHTML. Tool names,
 // verdicts, reasons and args originate from downstream MCP servers and must
-// never be treated as markup.
-const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// never be treated as markup. (Definition shared with the server via CLIENT_ESC_FN.)
+${CLIENT_ESC_FN}
 (function(){
   const g=document.getElementById('sg');
   const cards=[
@@ -3223,7 +3215,7 @@ async function cmdToolGraph(flags: string[]): Promise<void> {
 
   // ── Generate DOT format ───────────────────────────────────────────────────
   function nodeId(tool: string): string {
-    return `"${tool.replace(/"/g, '\\"')}"`;
+    return `"${escapeDotString(tool)}"`;
   }
 
   function denyColor(rate: number): string {
@@ -3245,7 +3237,9 @@ async function cmdToolGraph(flags: string[]): Promise<void> {
     '  // Nodes',
     ...nodes.map(n => {
       const color = denyColor(n.denyRate);
-      const label = `${n.tool}\\n${n.calls} calls (${n.denyRate}% blocked)`;
+      // Escape the tool name inside the label so a name containing a quote
+      // can't inject arbitrary DOT node attributes.
+      const label = `${escapeDotString(n.tool)}\\n${n.calls} calls (${n.denyRate}% blocked)`;
       return `  ${nodeId(n.tool)} [label="${label}" fillcolor="${color}" fontcolor="#000000"];`;
     }),
     '',
