@@ -156,6 +156,15 @@ export class WebhookAlerter {
     this.targets       = config.targets ?? [];
     this.allowedEvents = new Set(config.on ?? ['deny', 'kill', 'rate-limit']);
     this.version       = version;
+
+    // Alert payloads carry the shared secret (X-Warden-Secret) and scrubbed
+    // args over the wire. Warn loudly when a target uses plaintext http:// so
+    // operators don't unknowingly ship those over an interceptable channel.
+    for (const t of this.targets) {
+      if (/^http:\/\//i.test(t.url)) {
+        log(`WARNING: webhook target uses insecure http:// — secret and payload are sent in cleartext → ${t.url}`);
+      }
+    }
   }
 
   /**

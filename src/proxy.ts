@@ -269,6 +269,11 @@ export async function runProxy(config: WardenConfig): Promise<void> {
           });
         } catch (err: unknown) {
           const errMsg = err instanceof Error ? err.message : String(err);
+          // Downstream error text can echo back secrets that appeared in the
+          // request (e.g. "invalid token ghp_..."). Scrub it before it lands
+          // in the audit log or is returned upstream — the args field is
+          // already scrubbed, this closes the matching gap on error strings.
+          const safeErr = String(scrub(errMsg));
           const durationMs = Date.now() - startMs;
 
           const entry: AuditEntry = {
@@ -276,16 +281,16 @@ export async function runProxy(config: WardenConfig): Promise<void> {
             tool:       toolName,
             args:       scrubbedArgs,
             verdict:    'allow',
-            reason:     `forwarded — downstream threw: ${errMsg}`,
+            reason:     `forwarded — downstream threw: ${safeErr}`,
             durationMs,
-            error:      errMsg,
+            error:      safeErr,
           };
           audit.log(entry);
 
-          log(`ERROR ${toolName} (${durationMs}ms) — ${errMsg}`);
+          log(`ERROR ${toolName} (${durationMs}ms) — ${safeErr}`);
           return {
             content: [
-              { type: 'text' as const, text: `[warden] Downstream error: ${errMsg}` },
+              { type: 'text' as const, text: `[warden] Downstream error: ${safeErr}` },
             ],
             isError: true,
           };

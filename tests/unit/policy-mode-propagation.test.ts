@@ -92,18 +92,23 @@ describe('mode propagation into policy engine (Critical fix)', () => {
 
 describe('server-prefix normalization for built-in checks (High fix)', () => {
   let stderrSpy: jest.SpyInstance;
+  let projectDir: string;
   const cfg = (c: Partial<PolicyConfig>): PolicyConfig =>
     ({ defaultAction: 'allow', rules: [], ...c } as unknown as PolicyConfig);
 
   beforeEach(() => {
     stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    // Real directory so the realpath-based isOutsideCwd check has something to
+    // resolve (a non-existent cwd fails closed by design).
+    projectDir = makeTmpDir();
   });
-  afterEach(() => stderrSpy.mockRestore());
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  });
 
   test('prefixed fs-write to an out-of-cwd path is denied in enforce mode', () => {
-    const engine = createPolicyEngine(
-      cfg({ mode: 'enforce', cwd: '/home/user/project' }),
-    );
+    const engine = createPolicyEngine(cfg({ mode: 'enforce', cwd: projectDir }));
     const decision = engine.evaluate('filesystem/write_file', {
       path: '/etc/cron.d/pwn',
       content: 'x',
@@ -113,14 +118,26 @@ describe('server-prefix normalization for built-in checks (High fix)', () => {
   });
 
   test('prefixed fs-write inside cwd is allowed', () => {
-    const engine = createPolicyEngine(
-      cfg({ mode: 'enforce', cwd: '/home/user/project' }),
-    );
+    const engine = createPolicyEngine(cfg({ mode: 'enforce', cwd: projectDir }));
     const decision = engine.evaluate('filesystem/write_file', {
-      path: '/home/user/project/notes.txt',
+      path: path.join(projectDir, 'notes.txt'),
       content: 'x',
     });
     expect(decision.action).toBe('allow');
+  });
+
+  test('a cwd-internal symlink pointing outside cannot smuggle a write', () => {
+    // projectDir/escape -> / ; a write to projectDir/escape/tmp/x is lexically
+    // "inside" projectDir but really lands at /tmp/x.
+    const link = path.join(projectDir, 'escape');
+    fs.symlinkSync(path.parse(projectDir).root, link);
+    const engine = createPolicyEngine(cfg({ mode: 'enforce', cwd: projectDir }));
+    const decision = engine.evaluate('filesystem/write_file', {
+      path: path.join(link, 'etc', 'pwn'),
+      content: 'x',
+    });
+    expect(decision.action).toBe('deny');
+    expect(decision.isDangerous).toBe(true);
   });
 
   test('prefixed dangerous-keyword tool is denied in enforce mode', () => {

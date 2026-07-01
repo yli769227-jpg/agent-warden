@@ -32,10 +32,10 @@ jobs:
         run: npm run build
 
       - name: Unit tests
-        run: npm run test:unit -- --passWithNoTests
+        run: npm run test:unit
 
       - name: Integration tests
-        run: npm run test:integration -- --passWithNoTests
+        run: npm run test:integration
         timeout-minutes: 3
 
       - name: Smoke test CLI

@@ -191,6 +191,33 @@ export function loadConfig(configPath?: string): WardenConfig {
     `[warden:config] Policy mode = ${merged.policy?.mode ?? 'audit'}\n`,
   );
 
+  // ── Validate enum fields (fail loud, not open) ─────────────────────────────
+  // A typo like `mode: enforcee` or `defaultAction: deney` must NOT silently
+  // degrade into audit/allow — for a security tool that means every intended
+  // deny is quietly forwarded. Reject unknown enum values with a clear error.
+  const assertEnum = (
+    value: unknown,
+    allowed: readonly string[],
+    field: string,
+  ): void => {
+    if (value !== undefined && !allowed.includes(value as string)) {
+      throw new Error(
+        `[warden:config] Invalid ${field} "${String(value)}" in "${resolvedPath}". ` +
+          `Expected one of: ${allowed.join(', ')}.`,
+      );
+    }
+  };
+  assertEnum(merged.mode, ['audit', 'enforce'], 'mode');
+  assertEnum(merged.policy?.mode, ['audit', 'enforce'], 'policy.mode');
+  assertEnum(
+    merged.policy?.defaultAction,
+    ['allow', 'deny'],
+    'policy.defaultAction',
+  );
+  (merged.policy?.rules ?? []).forEach((rule, i) => {
+    assertEnum(rule?.action, ['allow', 'deny'], `policy.rules[${i}].action`);
+  });
+
   // ── Validate required fields ───────────────────────────────────────────────
   const hasServers =
     merged.servers != null && Object.keys(merged.servers).length > 0;

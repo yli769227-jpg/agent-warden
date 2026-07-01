@@ -14,6 +14,7 @@
  */
 
 import path from 'node:path';
+import fs from 'node:fs';
 import { PolicyConfig, PolicyRule } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -128,18 +129,50 @@ function extractStrings(value: unknown, depth = 0): string[] {
 }
 
 /**
+ * Resolves symlinks on the deepest existing prefix of `p` and re-appends the
+ * not-yet-existing tail.  Write targets usually don't exist yet, so we can't
+ * realpath the full path directly; resolving the existing parent still defeats
+ * a symlinked directory in the middle of the path.
+ */
+function realpathOfNearestExisting(p: string): string {
+  let current = path.resolve(p);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync(current);
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) {
+        // Reached the filesystem root without resolving — fall back to lexical.
+        return path.resolve(p);
+      }
+      tail.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
  * Returns true when `filePath` resolves to a location that is NOT inside
- * (or equal to) `cwd`.
+ * (or equal to) `cwd`.  Symlinks are resolved on both sides so a cwd-internal
+ * symlink pointing outside (e.g. `data -> /`) cannot smuggle a write past the
+ * check.  Fails CLOSED — if the real location cannot be determined, the path
+ * is treated as outside.
  */
 function isOutsideCwd(filePath: string, cwd: string): boolean {
-  const resolved = path.isAbsolute(filePath)
+  const resolvedInput = path.isAbsolute(filePath)
     ? path.normalize(filePath)
     : path.resolve(cwd, filePath);
-  const normalizedCwd = path.resolve(cwd);
-  return (
-    resolved !== normalizedCwd &&
-    !resolved.startsWith(normalizedCwd + path.sep)
-  );
+  let real: string;
+  let realCwd: string;
+  try {
+    real = realpathOfNearestExisting(resolvedInput);
+    realCwd = fs.realpathSync(path.resolve(cwd));
+  } catch {
+    return true;
+  }
+  return real !== realCwd && !real.startsWith(realCwd + path.sep);
 }
 
 /**
